@@ -1,0 +1,72 @@
+@import "tailwindcss";
+
+:root {
+  --color-primary: #0058a3;
+  --color-primary-light: #e0f0ff;
+  --color-surface: #ffffff;
+  --color-surface-alt: #f8f9fa;
+  --color-border: #e5e7eb;
+  --color-text: #1a1a2e;
+  --color-text-secondary: #6b7280;
+  --color-accent: #ffdb00;
+}
+
+body {
+  margin: 0;
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  color: var(--color-text);
+  background: var(--color-surface);
+}
+
+#root {
+  min-height: 100vh;
+}
+
+/* ── Vega chart rendering ── */
+
+/* Ensure SVGs inside chart containers scale properly */
+.chart-container svg {
+  max-width: 100%;
+  height: auto !important;
+}
+
+/* Suppress the default Vega title since we render our own in ChartCard header.
+   Only suppress the top-level title element (first <text> with class "role-title"). */
+.chart-container .vega-embed {
+  width: 100%;
+}
+
+/* ── Custom Vega tooltip ── */
+
+#vg-tooltip-element,
+.vg-tooltip {
+  font-family: 'Inter', system-ui, -apple-system, sans-serif !important;
+  font-size: 12px !important;
+  background: #1f2937 !important;
+  color: #f9fafb !important;
+  border: none !important;
+  border-radius: 8px !important;
+  padding: 8px 12px !important;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15) !important;
+  max-width: 280px !important;
+  line-height: 1.5 !important;
+}
+
+#vg-tooltip-element td,
+.vg-tooltip td {
+  border: none !important;
+  padding: 1px 0 !important;
+}
+
+#vg-tooltip-element .key,
+.vg-tooltip .key {
+  color: #9ca3af !important;
+  font-weight: 500 !important;
+  padding-right: 8px !important;
+}
+
+#vg-tooltip-element .value,
+.vg-tooltip .value {
+  color: #f9fafb !important;
+  font-weight: 600 !important;
+}
