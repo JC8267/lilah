@@ -298,6 +298,25 @@ def _score_question_match(query: str, candidate: dict[str, Any]) -> float:
     ):
         score -= 10.0
 
+    if _is_home_size_intent(query_text):
+        if (
+            "square footage" in cand_text
+            and "your home" in cand_text
+            and "bedroom" not in cand_text
+        ):
+            score += 8.0
+        if any(
+            x in cand_text
+            for x in (
+                "bedroom",
+                "this room",
+                "kitchen area",
+                "dining room",
+                "room?",
+            )
+        ):
+            score -= 8.0
+
     return score
 
 
@@ -432,6 +451,72 @@ def _is_age_homeownership_intent(text: str) -> bool:
     )
 
 
+def _is_bedroom_size_intent(text: str) -> bool:
+    q = (text or "").lower()
+    return any(t in q for t in ("bedroom", "bed room", "master bedroom"))
+
+
+def _is_home_size_intent(text: str) -> bool:
+    q = (text or "").lower()
+    if any(t in q for t in ("homeowner", "home ownership", "ownership")):
+        return False
+    has_home_context = any(t in q for t in ("home", "homes", "house", "houses"))
+    has_size_context = any(
+        t in q
+        for t in (
+            "square footage",
+            "sq ft",
+            "sqft",
+            "how large",
+            "how big",
+            "size",
+            "large",
+            "big",
+            "average home",
+            "average house",
+        )
+    )
+    return has_home_context and has_size_context and not _is_bedroom_size_intent(q)
+
+
+def _pick_home_size_question_match(matches: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for candidate in matches:
+        text = str(candidate.get("question_text", "")).lower()
+        if (
+            "square footage" in text
+            and "your home" in text
+            and "bedroom" not in text
+        ):
+            return candidate
+
+    sql = """
+        SELECT
+            question_id,
+            question_group,
+            question_text,
+            has_question_level,
+            response_option_count,
+            demo_break_count
+        FROM question_catalog
+        WHERE LOWER(question_text) LIKE '%square footage%'
+          AND LOWER(question_text) LIKE '%your home%'
+          AND LOWER(question_text) NOT LIKE '%bedroom%'
+        ORDER BY
+          CASE WHEN question_id = 'IKEA5' THEN 0 ELSE 1 END,
+          question_id
+        LIMIT 1
+    """
+    result = execute_query(sql)
+    if "error" in result:
+        return None
+    rows = result.get("rows", [])
+    cols = result.get("columns", [])
+    if not rows or not cols:
+        return None
+    row = rows[0]
+    return dict(zip(cols, row))
+
+
 def _has_comparison_intent(text: str) -> bool:
     q = (text or "").lower()
     return any(
@@ -553,9 +638,15 @@ def _build_quick_insight(question: str, demo_level: str | None = None, top_n: in
     if not matches:
         return {"error": "No matching questions found."}
 
-    best, routed_demo_id = _select_question_match_and_route(question, matches)
-    if routed_demo_id:
-        return _build_demographic_breakout(demo_ids=[routed_demo_id], top_n=8)
+    best: dict[str, Any] | None = None
+    if _is_home_size_intent(question):
+        best = _pick_home_size_question_match(matches)
+
+    if best is None:
+        best, routed_demo_id = _select_question_match_and_route(question, matches)
+        if routed_demo_id:
+            return _build_demographic_breakout(demo_ids=[routed_demo_id], top_n=8)
+
     best = best or matches[0]
     question_id = str(best.get("question_id", "")).strip()
     question_text = str(best.get("question_text", "")).strip()
@@ -1666,6 +1757,11 @@ def build_direct_result_for_user_query(user_message: str) -> dict[str, Any] | No
             demo_ids=["TOTAL: Age"],
             top_n=8,
         )
+
+    if _is_home_size_intent(cleaned):
+        quick = _build_quick_insight(question=cleaned, top_n=8)
+        if "error" not in quick:
+            return quick
 
     # Common phrasing like "What types of homes do people live in?"
     if _is_housing_type_breakout_intent(cleaned):
