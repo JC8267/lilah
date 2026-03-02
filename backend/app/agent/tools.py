@@ -598,6 +598,12 @@ _ROOM_INTENT_GROUPS: dict[str, dict[str, str]] = {
     "improvements_planned": {
         "home": "IKEA703",
     },
+    "children_play_rooms": {
+        "home": "IKEA604",
+    },
+    "children_study_rooms": {
+        "home": "IKEA603",
+    },
 }
 
 
@@ -650,6 +656,18 @@ _ROOM_INTENT_META: dict[str, dict[str, str]] = {
         "item_label": "Planned improvement",
         "summary_noun": "planned improvement",
     },
+    "children_play_rooms": {
+        "analysis_type": "top_children_play_rooms",
+        "title_prefix": "Top Rooms Children Play In",
+        "item_label": "Room",
+        "summary_noun": "room",
+    },
+    "children_study_rooms": {
+        "analysis_type": "top_children_study_rooms",
+        "title_prefix": "Top Rooms Children Study In",
+        "item_label": "Room",
+        "summary_noun": "room",
+    },
 }
 
 
@@ -674,6 +692,27 @@ def _detect_room_matrix_intent(text: str) -> str | None:
 
     if _is_planned_purchase_intent(q):
         return "planned_purchases"
+
+    has_children_terms = any(
+        t in q
+        for t in (
+            "children",
+            "child",
+            "kids",
+            "kid",
+        )
+    )
+    has_room_terms = any(t in q for t in ("room", "rooms", "which room", "which rooms"))
+    has_where_children = bool(re.search(r"\bwhere\b.*\b(children|child|kids|kid)\b", q)) or bool(
+        re.search(r"\b(children|child|kids|kid)\b.*\bwhere\b", q)
+    )
+    has_play_terms = any(t in q for t in ("play", "playing", "playtime"))
+    has_study_terms = any(t in q for t in ("study", "studying", "homework", "schoolwork"))
+    if has_children_terms and (has_room_terms or has_where_children):
+        if has_play_terms:
+            return "children_play_rooms"
+        if has_study_terms:
+            return "children_study_rooms"
 
     has_have = any(t in q for t in ("have ", " have", "owns", "own ", "features", "amenities"))
     has_item_context = any(
