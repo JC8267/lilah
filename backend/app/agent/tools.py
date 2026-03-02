@@ -492,7 +492,10 @@ def _is_planned_purchase_intent(text: str) -> bool:
     q = (text or "").lower()
     has_purchase = any(t in q for t in ("purchase", "purchases", "buy", "buying"))
     has_plan = any(t in q for t in ("plan", "planned", "planning", "next 12 months"))
-    return has_purchase and has_plan
+    has_top_purchase_phrase = any(
+        t in q for t in ("top purchases", "top purchase", "most purchased", "most bought")
+    )
+    return has_purchase and (has_plan or has_top_purchase_phrase)
 
 
 def _extract_room_hint(text: str) -> str | None:
@@ -505,8 +508,12 @@ def _extract_room_hint(text: str) -> str | None:
         return "bathroom"
     if any(t in q for t in ("dining room", "dining")):
         return "dining"
-    if any(t in q for t in ("living room", "main area", "family room")):
+    if "main area" in q:
+        return "main"
+    if any(t in q for t in ("living room", "family room")):
         return "living"
+    if any(t in q for t in ("home", "homes", "house", "houses")):
+        return "home"
     return None
 
 
@@ -546,12 +553,243 @@ def _resolve_planned_purchase_group(text: str) -> dict[str, str] | None:
     }
 
 
+_ROOM_INTENT_GROUPS: dict[str, dict[str, str]] = {
+    "have_items": {
+        "main": "IKEA102",
+        "bedroom": "IKEA202",
+        "kitchen": "IKEA304",
+        "living": "IKEA402",
+        "dining": "IKEA504",
+        "home": "IKEA8",
+    },
+    "planned_purchases": {
+        "main": "IKEA107",
+        "bedroom": "IKEA206",
+        "kitchen": "IKEA312",
+        "living": "IKEA407",
+        "dining": "IKEA509",
+        "home": "IKEA703",
+    },
+    "buying_factors": {
+        "main": "IKEA109",
+        "bedroom": "IKEA208",
+        "kitchen": "IKEA314",
+        "living": "IKEA409",
+        "dining": "IKEA511",
+    },
+    "activities_current": {
+        "main": "IKEA104a",
+        "bedroom": "IKEA204a",
+        "kitchen": "IKEA309a",
+        "dining": "IKEA506a",
+    },
+    "activities_desired": {
+        "main": "IKEA104b",
+        "bedroom": "IKEA204b",
+        "kitchen": "IKEA309b",
+        "dining": "IKEA506b",
+    },
+    "obstacles": {
+        "home": "IKEA705",
+    },
+    "improvements_made": {
+        "home": "IKEA12",
+    },
+    "improvements_planned": {
+        "home": "IKEA703",
+    },
+}
+
+
+_ROOM_INTENT_META: dict[str, dict[str, str]] = {
+    "have_items": {
+        "analysis_type": "top_owned_items",
+        "title_prefix": "Top Owned Items",
+        "item_label": "Owned item",
+        "summary_noun": "owned item",
+    },
+    "planned_purchases": {
+        "analysis_type": "top_planned_purchases",
+        "title_prefix": "Top Planned Purchases",
+        "item_label": "Planned purchase",
+        "summary_noun": "planned purchase",
+    },
+    "buying_factors": {
+        "analysis_type": "top_buying_factors",
+        "title_prefix": "Top Buying Factors",
+        "item_label": "Buying factor",
+        "summary_noun": "buying factor",
+    },
+    "activities_current": {
+        "analysis_type": "top_current_activities",
+        "title_prefix": "Top Current Activities",
+        "item_label": "Current activity",
+        "summary_noun": "activity",
+    },
+    "activities_desired": {
+        "analysis_type": "top_desired_activities",
+        "title_prefix": "Top Desired Activities",
+        "item_label": "Desired activity",
+        "summary_noun": "desired activity",
+    },
+    "obstacles": {
+        "analysis_type": "top_obstacles",
+        "title_prefix": "Top Obstacles",
+        "item_label": "Obstacle",
+        "summary_noun": "obstacle",
+    },
+    "improvements_made": {
+        "analysis_type": "top_completed_improvements",
+        "title_prefix": "Top Completed Improvements",
+        "item_label": "Completed improvement",
+        "summary_noun": "completed improvement",
+    },
+    "improvements_planned": {
+        "analysis_type": "top_planned_improvements",
+        "title_prefix": "Top Planned Improvements",
+        "item_label": "Planned improvement",
+        "summary_noun": "planned improvement",
+    },
+}
+
+
+def _resolve_group_question_text(question_group: str) -> str:
+    qg_sql = _escape_sql_literal(question_group)
+    sql = f"""
+        SELECT MIN(question_text) AS question_text
+        FROM question_catalog
+        WHERE question_group = '{qg_sql}'
+    """
+    result = execute_query(sql)
+    if "error" in result:
+        return question_group
+    rows = result.get("rows", [])
+    if not rows or not rows[0]:
+        return question_group
+    return str(rows[0][0] or question_group)
+
+
+def _detect_room_matrix_intent(text: str) -> str | None:
+    q = (text or "").lower()
+
+    if _is_planned_purchase_intent(q):
+        return "planned_purchases"
+
+    has_have = any(t in q for t in ("have ", " have", "owns", "own ", "features", "amenities"))
+    has_item_context = any(
+        t in q for t in ("furniture", "furnishings", "appliances", "items", "features", "amenities")
+    )
+    if has_have and has_item_context and "homeowner" not in q and "home ownership" not in q:
+        return "have_items"
+
+    if any(t in q for t in ("obstacle", "obstacles", "challenge", "barrier", "difficult")):
+        return "obstacles"
+
+    if any(t in q for t in ("factor", "factors", "important", "priority", "priorities")) and any(
+        t in q for t in ("buy", "buying", "purchase", "shopping")
+    ):
+        return "buying_factors"
+
+    if any(t in q for t in ("currently do", "regularly do", "current activities")):
+        return "activities_current"
+
+    if (
+        any(t in q for t in ("would like to", "if you could", "wish you could", "remaining activities"))
+        or bool(re.search(r"\bwould\b.*\blike to\b", q))
+    ):
+        return "activities_desired"
+
+    if any(t in q for t in ("improvement", "improvements", "changes")) and (
+        any(t in q for t in ("made in the last 12 months", "made in last 12 months", "have you made", "already made"))
+        or bool(re.search(r"\bmade\b.*\b12 months\b", q))
+    ):
+        return "improvements_made"
+
+    if any(
+        t in q
+        for t in (
+            "planned improvements",
+            "plan improvements",
+            "planning improvements",
+            "improvements are planned",
+            "planned changes",
+            "changes planned",
+        )
+    ):
+        return "improvements_planned"
+
+    return None
+
+
+def _resolve_room_intent_group(text: str) -> dict[str, Any] | None:
+    # Keep the high-precision planned-purchase catalog resolver as the first choice.
+    planned = _resolve_planned_purchase_group(text)
+    if planned:
+        meta = _ROOM_INTENT_META["planned_purchases"]
+        return {
+            "intent": "planned_purchases",
+            "question_group": planned["question_group"],
+            "question_text": planned["question_text"],
+            "room_hint": planned["room_hint"],
+            **meta,
+            "item_keywords": None,
+        }
+
+    intent = _detect_room_matrix_intent(text)
+    if not intent:
+        return None
+
+    room_map = _ROOM_INTENT_GROUPS.get(intent, {})
+    if not room_map:
+        return None
+
+    room_hint = _extract_room_hint(text)
+    target_room = room_hint if room_hint in room_map else None
+    if target_room is None:
+        if "home" in room_map:
+            target_room = "home"
+        elif "main" in room_map:
+            target_room = "main"
+        elif room_map:
+            target_room = next(iter(room_map.keys()))
+    if target_room is None:
+        return None
+
+    question_group = room_map[target_room]
+    question_text = _resolve_group_question_text(question_group)
+    meta = _ROOM_INTENT_META.get(intent, {})
+
+    item_keywords: list[str] | None = None
+    if intent == "obstacles" and room_hint in {"kitchen", "bedroom", "living", "dining"}:
+        synonyms = {
+            "kitchen": ["kitchen"],
+            "bedroom": ["bedroom"],
+            "living": ["living", "family room", "main area"],
+            "dining": ["dining"],
+        }
+        item_keywords = synonyms.get(room_hint, [room_hint])
+
+    return {
+        "intent": intent,
+        "question_group": question_group,
+        "question_text": question_text,
+        "room_hint": target_room,
+        "item_keywords": item_keywords,
+        **meta,
+    }
+
+
 def _build_top_selected_for_question_group(
     *,
     question_group: str,
     question_text: str,
     room_hint: str,
     top_n: int = 10,
+    analysis_type: str = "top_selected_items",
+    title_prefix: str = "Top Selected Items",
+    item_label: str = "Item",
+    summary_noun: str = "item",
+    item_keywords: list[str] | None = None,
 ) -> dict[str, Any]:
     top_n = max(3, min(int(top_n), 20))
     qg_sql = _escape_sql_literal(question_group)
@@ -579,6 +817,18 @@ def _build_top_selected_for_question_group(
         }
 
     pref_sql = _escape_sql_literal(preferred)
+    item_filter_sql = ""
+    clean_item_keywords: list[str] = []
+    if item_keywords:
+        clean_item_keywords = [k.strip().lower() for k in item_keywords if str(k).strip()]
+        if clean_item_keywords:
+            filters = " OR ".join(
+                f"LOWER(COALESCE(NULLIF(TRIM(question_level), ''), question_text, question_id)) "
+                f"LIKE '%{_escape_sql_literal(k)}%'"
+                for k in clean_item_keywords
+            )
+            item_filter_sql = f"AND ({filters})"
+
     data_sql = f"""
         SELECT
             COALESCE(NULLIF(TRIM(question_level), ''), question_id) AS item,
@@ -588,6 +838,7 @@ def _build_top_selected_for_question_group(
           AND LOWER(response_option) = LOWER('{pref_sql}')
           AND demo_id = 'Total'
           AND demo_level = 'TOTAL: Total respondents'
+          {item_filter_sql}
         GROUP BY item
         ORDER BY percent DESC
         LIMIT {top_n}
@@ -597,9 +848,28 @@ def _build_top_selected_for_question_group(
         return {"error": data_result["error"], "question_group": question_group}
 
     rows = data_result.get("rows", [])
+    if not rows and clean_item_keywords:
+        # Fallback to full group when keyword-filtered subset is empty.
+        data_sql = f"""
+            SELECT
+                COALESCE(NULLIF(TRIM(question_level), ''), question_id) AS item,
+                100.0 * AVG(TRY_CAST(response_value AS DOUBLE)) AS percent
+            FROM survey_long
+            WHERE question_group = '{qg_sql}'
+              AND LOWER(response_option) = LOWER('{pref_sql}')
+              AND demo_id = 'Total'
+              AND demo_level = 'TOTAL: Total respondents'
+            GROUP BY item
+            ORDER BY percent DESC
+            LIMIT {top_n}
+        """
+        data_result = execute_query(data_sql)
+        if "error" not in data_result:
+            rows = data_result.get("rows", [])
+
     if not rows:
         return {
-            "error": "No selected-item rows returned for planned-purchase group.",
+            "error": "No selected-item rows returned for this question group.",
             "question_group": question_group,
         }
 
@@ -614,7 +884,7 @@ def _build_top_selected_for_question_group(
 
     if not chart_values:
         return {
-            "error": "No numeric selected-item values available for planned purchases.",
+            "error": "No numeric selected-item values available for this group.",
             "question_group": question_group,
         }
 
@@ -627,7 +897,7 @@ def _build_top_selected_for_question_group(
     chart_spec: dict[str, Any] = {
         "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
         "title": {
-            "text": f"Top Planned Purchases — {title_room}",
+            "text": f"{title_prefix} — {title_room}",
             "subtitle": f"{question_group} · Response basis: {preferred}",
             "anchor": "start",
         },
@@ -648,7 +918,7 @@ def _build_top_selected_for_question_group(
                 "axis": {"format": ".0f", "grid": True},
             },
             "tooltip": [
-                {"field": "item", "type": "nominal", "title": "Planned purchase"},
+                {"field": "item", "type": "nominal", "title": item_label},
                 {"field": "percent", "type": "quantitative", "title": "% selected", "format": ".1f"},
             ],
         },
@@ -673,25 +943,28 @@ def _build_top_selected_for_question_group(
 
     lines = [
         f"**{question_group} — {question_text}**",
-        f"- Top planned purchase: **{top1['item']}** at **{top1['percent']:.2f}%** selected.",
+        f"- Top {summary_noun}: **{top1['item']}** at **{top1['percent']:.2f}%** selected.",
     ]
     if top2:
         lines.append(
-            f"- Runner-up: **{top2['item']}** at **{top2['percent']:.2f}%** "
+            f"- Runner-up {summary_noun}: **{top2['item']}** at **{top2['percent']:.2f}%** "
             f"({top1['percent'] - top2['percent']:.2f} pts behind)."
         )
     lines.append(f"- Concentration: top 3 items sum to **{top3_sum:.2f}%**.")
     lines.append(f"- Spread across shown items: **{spread:.2f} pts**.")
     lines.append(f"- Response basis: **{preferred}** among total respondents.")
+    if clean_item_keywords:
+        lines.append(f"- Filtered to items matching: {', '.join(sorted(set(clean_item_keywords)))}.")
 
     return {
-        "analysis_type": "top_planned_purchases",
+        "analysis_type": analysis_type,
         "question_group": question_group,
         "question_text": question_text,
         "room_hint": room_hint,
         "selected_response_option": preferred,
         "row_count": len(chart_values),
         "top_rows": chart_values,
+        "item_keywords": clean_item_keywords or None,
         "sql": data_sql.strip(),
         "insight_text": "\n".join(lines),
         "chart": chart_spec,
@@ -838,13 +1111,18 @@ def _resolve_demo_id_from_text(text: str) -> str | None:
 
 def _build_quick_insight(question: str, demo_level: str | None = None, top_n: int = 8) -> dict[str, Any]:
     """Fast path: search question -> fetch top response options -> create chart spec."""
-    planned_group = _resolve_planned_purchase_group(question)
-    if planned_group:
+    room_route = _resolve_room_intent_group(question)
+    if room_route:
         return _build_top_selected_for_question_group(
-            question_group=planned_group["question_group"],
-            question_text=planned_group["question_text"],
-            room_hint=planned_group["room_hint"],
+            question_group=str(room_route["question_group"]),
+            question_text=str(room_route["question_text"]),
+            room_hint=str(room_route["room_hint"]),
             top_n=min(top_n, 12),
+            analysis_type=str(room_route.get("analysis_type", "top_selected_items")),
+            title_prefix=str(room_route.get("title_prefix", "Top Selected Items")),
+            item_label=str(room_route.get("item_label", "Item")),
+            summary_noun=str(room_route.get("summary_noun", "item")),
+            item_keywords=room_route.get("item_keywords"),
         )
 
     if _is_age_homeownership_intent(question):
@@ -1952,13 +2230,18 @@ def build_direct_result_for_user_query(user_message: str) -> dict[str, Any] | No
     has_breakout_intent = any(t in q for t in breakout_terms)
     has_compare_intent = _has_comparison_intent(q)
 
-    planned_group = _resolve_planned_purchase_group(cleaned)
-    if planned_group:
+    room_route = _resolve_room_intent_group(cleaned)
+    if room_route:
         return _build_top_selected_for_question_group(
-            question_group=planned_group["question_group"],
-            question_text=planned_group["question_text"],
-            room_hint=planned_group["room_hint"],
+            question_group=str(room_route["question_group"]),
+            question_text=str(room_route["question_text"]),
+            room_hint=str(room_route["room_hint"]),
             top_n=10,
+            analysis_type=str(room_route.get("analysis_type", "top_selected_items")),
+            title_prefix=str(room_route.get("title_prefix", "Top Selected Items")),
+            item_label=str(room_route.get("item_label", "Item")),
+            summary_noun=str(room_route.get("summary_noun", "item")),
+            item_keywords=room_route.get("item_keywords"),
         )
 
     has_income = "income" in q
