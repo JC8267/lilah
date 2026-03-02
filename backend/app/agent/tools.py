@@ -434,6 +434,25 @@ def _pick_preferred_binary_response_option(options: list[str]) -> str | None:
     return None
 
 
+def _is_binary_response_option_set(options: list[str]) -> bool:
+    if not options:
+        return False
+    normalized = {str(o).strip().lower() for o in options if str(o).strip()}
+    if not normalized:
+        return False
+    allowed = {
+        "selected",
+        "not selected",
+        "yes",
+        "no",
+        "true",
+        "false",
+        "own",
+        "not own",
+    }
+    return len(normalized) <= 2 and normalized.issubset(allowed)
+
+
 def _is_housing_type_breakout_intent(text: str) -> bool:
     q = (text or "").lower()
     has_home_context = any(t in q for t in ("home", "homes", "housing", "house", "houses"))
@@ -1084,7 +1103,9 @@ DEMO_KEYWORD_TO_ID: list[tuple[str, str]] = [
     ("education", "TOTAL: Education"),
     ("home ownership", "TOTAL: Home Ownership"),
     ("homeowner", "TOTAL: Home Ownership"),
+    ("homeowners", "TOTAL: Home Ownership"),
     ("renter", "TOTAL: Home Ownership"),
+    ("renters", "TOTAL: Home Ownership"),
     ("housing type", "TOTAL: Housing Type"),
     ("home type", "TOTAL: Housing Type"),
     ("type of home", "TOTAL: Housing Type"),
@@ -1100,6 +1121,14 @@ DEMO_KEYWORD_TO_ID: list[tuple[str, str]] = [
 ]
 
 
+def _contains_keyword_phrase(text: str, keyword: str) -> bool:
+    phrase = " ".join(keyword.lower().split())
+    if not phrase:
+        return False
+    pattern = r"\b" + r"\s+".join(re.escape(part) for part in phrase.split(" ")) + r"\b"
+    return bool(re.search(pattern, text))
+
+
 def _resolve_demo_id_from_keywords(text: str) -> str | None:
     if _is_housing_type_breakout_intent(text):
         return "TOTAL: Housing Type"
@@ -1110,7 +1139,7 @@ def _resolve_demo_id_from_keywords(text: str) -> str | None:
         return "TOTAL: Housing Type"
 
     for keyword, demo_id in DEMO_KEYWORD_TO_ID:
-        if keyword in q:
+        if _contains_keyword_phrase(q, keyword):
             return demo_id
     return None
 
@@ -1153,6 +1182,692 @@ def _resolve_demo_id_from_text(text: str) -> str | None:
     if not rows:
         return None
     return str(rows[0][0])
+
+
+def _is_extreme_difference_intent(text: str) -> bool:
+    q = (text or "").lower()
+    has_operator = any(
+        t in q
+        for t in (
+            "most different",
+            "biggest difference",
+            "largest difference",
+            "smallest difference",
+            "least different",
+            "closest",
+            "most similar",
+            "furthest",
+            "farthest",
+            "higher than",
+            "lower than",
+            "over index",
+            "under index",
+            "over-index",
+            "under-index",
+        )
+    )
+    has_comparison = any(
+        t in q
+        for t in (
+            "different",
+            "difference",
+            "differ",
+            "vs ",
+            " versus ",
+            "compared",
+            "against",
+            "than national",
+            "national average",
+            "national averages",
+            "than total",
+            "total respondents",
+        )
+    )
+    return has_operator and has_comparison
+
+
+def _detect_extreme_operator(text: str) -> str:
+    q = (text or "").lower()
+    if any(t in q for t in ("lower than", "lowest versus", "under index", "under-index", "below")):
+        return "lower"
+    if any(t in q for t in ("higher than", "highest versus", "over index", "over-index", "above")):
+        return "higher"
+    if any(t in q for t in ("closest", "most similar", "least different", "smallest difference")):
+        return "closest"
+    return "most_different"
+
+
+def _extract_extreme_subject_query(text: str) -> str | None:
+    raw = (text or "").strip()
+    if not raw:
+        return None
+
+    patterns = [
+        r"when it comes to\s+(.+)$",
+        r"in terms of\s+(.+)$",
+        r"regarding\s+(.+)$",
+        r"about\s+(.+)$",
+        r"for\s+(.+)$",
+        r"on\s+(.+)$",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, raw, flags=re.IGNORECASE)
+        if not match:
+            continue
+        candidate = re.sub(r"\s+", " ", match.group(1)).strip(" .?!")
+        if not candidate:
+            continue
+        if len(_extract_answerability_anchor_tokens(candidate)) >= 1:
+            return candidate
+
+    return None
+
+
+def _resolve_target_demo_level_for_query(demo_id: str, query: str) -> str | None:
+    did_sql = _escape_sql_literal(demo_id)
+    sql = f"""
+        SELECT DISTINCT demo_level
+        FROM survey_long
+        WHERE demo_id = '{did_sql}'
+          AND demo_level IS NOT NULL
+          AND TRIM(demo_level) <> ''
+        ORDER BY demo_level
+    """
+    result = execute_query(sql)
+    if "error" in result:
+        return None
+
+    levels = [str(r[0]).strip() for r in result.get("rows", []) if r and str(r[0]).strip()]
+    if not levels:
+        return None
+    if len(levels) == 1:
+        return levels[0]
+
+    q = query.lower()
+    q_tokens = {
+        t
+        for t in _tokenize_for_match(q)
+        if len(t) >= 3 and t not in _QUESTION_STOPWORDS
+    }
+
+    preferred_tokens: list[str] = []
+    if demo_id == "TOTAL: Home Ownership":
+        if any(t in q for t in ("renter", "renters", "renting")):
+            preferred_tokens = ["renter", "rent"]
+        elif any(t in q for t in ("homeowner", "homeowners", "owner", "owners", "own")):
+            preferred_tokens = ["homeowner", "own"]
+    elif demo_id == "TOTAL: Housing Type":
+        if any(t in q for t in ("apartment", "apartments", "apt")):
+            preferred_tokens = ["apartment", "apt"]
+        elif any(t in q for t in ("single family", "single-home", "single home", "detached")):
+            preferred_tokens = ["single", "home"]
+        elif any(t in q for t in ("multifamily", "multi-family", "duplex", "condo", "townhome", "townhouse")):
+            preferred_tokens = ["multifamily", "duplex", "condo", "townhome", "townhouse", "multi"]
+    elif demo_id == "TOTAL: Area Type":
+        if "urban" in q:
+            preferred_tokens = ["urban"]
+        elif "suburban" in q:
+            preferred_tokens = ["suburban"]
+        elif "rural" in q:
+            preferred_tokens = ["rural"]
+    elif demo_id == "TOTAL: Region":
+        for region in ("midwest", "northeast", "south", "west"):
+            if region in q:
+                preferred_tokens = [region]
+                break
+    elif demo_id == "TOTAL: Children in Household":
+        if any(t in q for t in ("without children", "no children", "childless")):
+            preferred_tokens = ["without", "no"]
+        elif any(t in q for t in ("with children", "kids", "children")):
+            preferred_tokens = ["children", "with"]
+
+    best_level: str | None = None
+    best_score = float("-inf")
+    for level in levels:
+        short_level = _short_demo_level(level).lower()
+        level_tokens = set(_tokenize_for_match(short_level))
+        score = 0.0
+
+        if short_level and short_level in q:
+            score += 6.0
+
+        overlap = len(level_tokens.intersection(q_tokens))
+        score += float(overlap) * 1.5
+
+        for token in preferred_tokens:
+            if token and token in level_tokens:
+                score += 4.0
+
+        if score > best_score:
+            best_score = score
+            best_level = level
+
+    if best_level and best_score > 0:
+        return best_level
+    return None
+
+
+def _resolve_extreme_difference_request(text: str) -> dict[str, str] | None:
+    if not _is_extreme_difference_intent(text):
+        return None
+
+    demo_id = _resolve_demo_id_from_text(text)
+    if not demo_id:
+        return None
+
+    target_demo_level = _resolve_target_demo_level_for_query(demo_id, text)
+    if not target_demo_level:
+        return None
+
+    subject = _extract_extreme_subject_query(text)
+    if not subject:
+        return None
+
+    operator = _detect_extreme_operator(text)
+    return {
+        "question": subject,
+        "demo_id": demo_id,
+        "target_demo_level": target_demo_level,
+        "operator": operator,
+    }
+
+
+def _build_extreme_difference_by_demographic(
+    *,
+    question: str,
+    demo_id: str,
+    target_demo_level: str,
+    operator: str = "most_different",
+    top_n: int = 8,
+) -> dict[str, Any]:
+    top_n = max(3, min(int(top_n), 15))
+    did_sql = _escape_sql_literal(demo_id)
+    level_sql = _escape_sql_literal(target_demo_level)
+    question_group: str | None = None
+    question_id: str | None = None
+
+    room_route = _resolve_room_intent_group(question)
+    if room_route:
+        question_group = str(room_route.get("question_group", "")).strip()
+        question_text = str(room_route.get("question_text", "")).strip()
+        if not question_group:
+            return {"error": "Resolved room intent is missing question_group."}
+    else:
+        search_result = search_questions(question)
+        if "error" in search_result:
+            return {"error": search_result["error"]}
+
+        matches = search_result.get("results", [])
+        if not matches:
+            return {"error": "No matching questions found for extreme-difference analysis."}
+
+        best, routed_demo_id = _select_question_match_and_route(question, matches)
+        if routed_demo_id:
+            return {"error": "Extreme-difference analysis requires a concrete survey question, not a demographic-only route."}
+        best = best or matches[0]
+        question_id = str(best.get("question_id", "")).strip()
+        question_text = str(best.get("question_text", "")).strip()
+        if not question_id:
+            return {"error": "Matched question is missing question_id."}
+
+    qid_sql = _escape_sql_literal(question_id) if question_id else ""
+    qg_sql = _escape_sql_literal(question_group) if question_group else ""
+
+    if question_group:
+        option_sql = f"""
+            SELECT DISTINCT response_option
+            FROM survey_long
+            WHERE question_group = '{qg_sql}'
+              AND demo_id = '{did_sql}'
+              AND demo_level = '{level_sql}'
+              AND response_option IS NOT NULL
+              AND TRIM(response_option) <> ''
+            ORDER BY response_option
+        """
+    else:
+        option_sql = f"""
+            SELECT DISTINCT response_option
+            FROM survey_long
+            WHERE question_id = '{qid_sql}'
+              AND demo_id = '{did_sql}'
+              AND demo_level = '{level_sql}'
+              AND response_option IS NOT NULL
+              AND TRIM(response_option) <> ''
+            ORDER BY response_option
+        """
+    option_result = execute_query(option_sql)
+    option_values = [
+        str(r[0]).strip()
+        for r in option_result.get("rows", [])
+        if r and str(r[0]).strip()
+    ] if "error" not in option_result else []
+
+    response_filter_sql = ""
+    selected_only = False
+    if _is_binary_response_option_set(option_values):
+        preferred = _pick_preferred_binary_response_option(option_values)
+        if preferred:
+            selected_only = True
+            response_filter_sql = (
+                f"AND LOWER(response_option) = LOWER('{_escape_sql_literal(preferred)}')"
+            )
+
+    if question_group:
+        sql = f"""
+            WITH base AS (
+                SELECT
+                    demo_id,
+                    demo_level,
+                    COALESCE(NULLIF(TRIM(question_level), ''), question_id) AS response_option,
+                    AVG(TRY_CAST(response_value AS DOUBLE)) AS response_value,
+                    AVG(TRY_CAST(weighted_margin_of_error AS DOUBLE)) AS weighted_moe,
+                    AVG(TRY_CAST(unweighted_margin_of_error AS DOUBLE)) AS unweighted_moe
+                FROM survey_long
+                WHERE question_group = '{qg_sql}'
+                  AND response_option IS NOT NULL
+                  AND TRIM(response_option) <> ''
+                  AND (
+                        (demo_id = '{did_sql}' AND demo_level = '{level_sql}')
+                        OR (demo_id = 'Total' AND demo_level = 'TOTAL: Total respondents')
+                  )
+                  {response_filter_sql}
+                GROUP BY
+                    demo_id,
+                    demo_level,
+                    COALESCE(NULLIF(TRIM(question_level), ''), question_id)
+            ),
+            pivoted AS (
+                SELECT
+                    response_option,
+                    MAX(
+                        CASE
+                            WHEN demo_id = '{did_sql}' AND demo_level = '{level_sql}'
+                            THEN 100.0 * response_value
+                            ELSE NULL
+                        END
+                    ) AS target_percent,
+                    MAX(
+                        CASE
+                            WHEN demo_id = 'Total' AND demo_level = 'TOTAL: Total respondents'
+                            THEN 100.0 * response_value
+                            ELSE NULL
+                        END
+                    ) AS national_percent,
+                    MAX(
+                        CASE
+                            WHEN demo_id = '{did_sql}' AND demo_level = '{level_sql}'
+                            THEN 100.0 * COALESCE(weighted_moe, unweighted_moe)
+                            ELSE NULL
+                        END
+                    ) AS target_moe,
+                    MAX(
+                        CASE
+                            WHEN demo_id = 'Total' AND demo_level = 'TOTAL: Total respondents'
+                            THEN 100.0 * COALESCE(weighted_moe, unweighted_moe)
+                            ELSE NULL
+                        END
+                    ) AS national_moe
+                FROM base
+                GROUP BY response_option
+            )
+            SELECT
+                response_option,
+                target_percent,
+                national_percent,
+                target_moe,
+                national_moe
+            FROM pivoted
+            WHERE target_percent IS NOT NULL
+              AND national_percent IS NOT NULL
+        """
+    else:
+        sql = f"""
+            WITH base AS (
+                SELECT
+                    demo_id,
+                    demo_level,
+                    response_option,
+                    AVG(TRY_CAST(response_value AS DOUBLE)) AS response_value,
+                    AVG(TRY_CAST(weighted_margin_of_error AS DOUBLE)) AS weighted_moe,
+                    AVG(TRY_CAST(unweighted_margin_of_error AS DOUBLE)) AS unweighted_moe
+                FROM survey_long
+                WHERE question_id = '{qid_sql}'
+                  AND response_option IS NOT NULL
+                  AND TRIM(response_option) <> ''
+                  AND (
+                        (demo_id = '{did_sql}' AND demo_level = '{level_sql}')
+                        OR (demo_id = 'Total' AND demo_level = 'TOTAL: Total respondents')
+                  )
+                  {response_filter_sql}
+                GROUP BY demo_id, demo_level, response_option
+            ),
+            pivoted AS (
+                SELECT
+                    response_option,
+                    MAX(
+                        CASE
+                            WHEN demo_id = '{did_sql}' AND demo_level = '{level_sql}'
+                            THEN 100.0 * response_value
+                            ELSE NULL
+                        END
+                    ) AS target_percent,
+                    MAX(
+                        CASE
+                            WHEN demo_id = 'Total' AND demo_level = 'TOTAL: Total respondents'
+                            THEN 100.0 * response_value
+                            ELSE NULL
+                        END
+                    ) AS national_percent,
+                    MAX(
+                        CASE
+                            WHEN demo_id = '{did_sql}' AND demo_level = '{level_sql}'
+                            THEN 100.0 * COALESCE(weighted_moe, unweighted_moe)
+                            ELSE NULL
+                        END
+                    ) AS target_moe,
+                    MAX(
+                        CASE
+                            WHEN demo_id = 'Total' AND demo_level = 'TOTAL: Total respondents'
+                            THEN 100.0 * COALESCE(weighted_moe, unweighted_moe)
+                            ELSE NULL
+                        END
+                    ) AS national_moe
+                FROM base
+                GROUP BY response_option
+            )
+            SELECT
+                response_option,
+                target_percent,
+                national_percent,
+                target_moe,
+                national_moe
+            FROM pivoted
+            WHERE target_percent IS NOT NULL
+              AND national_percent IS NOT NULL
+        """
+
+    result = execute_query(sql)
+    if "error" in result:
+        return {
+            "error": result["error"],
+            "question_id": question_id,
+            "question_group": question_group,
+            "question_text": question_text,
+            "demo_id": demo_id,
+            "target_demo_level": target_demo_level,
+        }
+
+    rows = result.get("rows", [])
+    cols = result.get("columns", [])
+    if not rows:
+        return {
+            "error": "No comparable rows returned for target-vs-national analysis.",
+            "question_id": question_id,
+            "question_group": question_group,
+            "question_text": question_text,
+            "demo_id": demo_id,
+            "target_demo_level": target_demo_level,
+        }
+
+    i_opt = cols.index("response_option")
+    i_target = cols.index("target_percent")
+    i_nat = cols.index("national_percent")
+    i_target_moe = cols.index("target_moe") if "target_moe" in cols else -1
+    i_nat_moe = cols.index("national_moe") if "national_moe" in cols else -1
+
+    stats: list[dict[str, Any]] = []
+    for row in rows:
+        option = str(row[i_opt]).strip()
+        try:
+            target_pct = float(row[i_target])
+            national_pct = float(row[i_nat])
+        except (TypeError, ValueError):
+            continue
+        target_moe: float | None = None
+        national_moe: float | None = None
+        if i_target_moe >= 0:
+            try:
+                raw = row[i_target_moe]
+                target_moe = float(raw) if raw is not None else None
+            except (TypeError, ValueError):
+                target_moe = None
+        if i_nat_moe >= 0:
+            try:
+                raw = row[i_nat_moe]
+                national_moe = float(raw) if raw is not None else None
+            except (TypeError, ValueError):
+                national_moe = None
+
+        delta = target_pct - national_pct
+        abs_delta = abs(delta)
+        combined_moe: float | None = None
+        is_significant = False
+        significance_ratio: float | None = None
+        if target_moe is not None and national_moe is not None:
+            combined_moe = (target_moe ** 2 + national_moe ** 2) ** 0.5
+            if combined_moe > 0:
+                significance_ratio = abs_delta / combined_moe
+            is_significant = abs_delta > combined_moe
+
+        stats.append(
+            {
+                "response_option": option,
+                "target_percent": target_pct,
+                "national_percent": national_pct,
+                "delta_points": delta,
+                "abs_delta_points": abs_delta,
+                "target_moe_points": target_moe,
+                "national_moe_points": national_moe,
+                "combined_moe_points": combined_moe,
+                "is_significant": is_significant,
+                "significance_ratio": significance_ratio,
+            }
+        )
+
+    if not stats:
+        return {
+            "error": "No numeric rows available for target-vs-national analysis.",
+            "question_id": question_id,
+            "question_group": question_group,
+            "question_text": question_text,
+            "demo_id": demo_id,
+            "target_demo_level": target_demo_level,
+        }
+
+    candidates = list(stats)
+    if operator == "higher":
+        positive = [x for x in candidates if x["delta_points"] > 0]
+        if positive:
+            candidates = positive
+        ranked = sorted(
+            candidates,
+            key=lambda x: (x["delta_points"], x["significance_ratio"] or -1.0),
+            reverse=True,
+        )
+    elif operator == "lower":
+        negative = [x for x in candidates if x["delta_points"] < 0]
+        if negative:
+            candidates = negative
+        ranked = sorted(
+            candidates,
+            key=lambda x: (x["delta_points"], -x["significance_ratio"] if x["significance_ratio"] is not None else 1.0),
+        )
+    elif operator == "closest":
+        ranked = sorted(
+            candidates,
+            key=lambda x: (x["abs_delta_points"], -(x["significance_ratio"] or 0.0)),
+        )
+    else:
+        ranked = sorted(
+            candidates,
+            key=lambda x: (x["abs_delta_points"], x["significance_ratio"] or -1.0),
+            reverse=True,
+        )
+
+    ranked = ranked[:top_n]
+    if not ranked:
+        return {
+            "error": "No ranked differences were produced for this request.",
+            "question_id": question_id,
+            "question_group": question_group,
+            "question_text": question_text,
+            "demo_id": demo_id,
+            "target_demo_level": target_demo_level,
+        }
+
+    operator_label = {
+        "most_different": "Most Different",
+        "closest": "Closest To National",
+        "higher": "Most Above National",
+        "lower": "Most Below National",
+    }.get(operator, "Most Different")
+
+    top = ranked[0]
+    target_label = _short_demo_level(target_demo_level)
+    question_ref = question_id or question_group or "Question"
+    significant_count = sum(1 for x in ranked if x["is_significant"])
+    missing_moe_count = sum(1 for x in ranked if x["combined_moe_points"] is None)
+
+    lead_sign = "+" if top["delta_points"] >= 0 else ""
+    lead_sig_txt = "significance unavailable"
+    if top["combined_moe_points"] is not None:
+        if top["is_significant"]:
+            lead_sig_txt = "statistically significant at ~95%"
+        else:
+            lead_sig_txt = "not statistically significant at ~95%"
+
+    narrative_lines = [
+        f"**{question_ref} — {question_text}**",
+        f"- {operator_label}: **{top['response_option']}** ({target_label} **{top['target_percent']:.2f}%** vs National **{top['national_percent']:.2f}%**, **{lead_sign}{top['delta_points']:.2f} pts**; {lead_sig_txt}).",
+        f"- Scope: ranked by {'absolute gap vs national' if operator in {'most_different', 'closest'} else 'signed gap vs national'} for **{target_label}**.",
+        f"- Significant differences among shown rows (~95%): **{significant_count}/{len(ranked)}**.",
+    ]
+    if missing_moe_count > 0:
+        narrative_lines.append(
+            f"- MOE missing for **{missing_moe_count}** row(s); significance for those rows is unavailable."
+        )
+    if selected_only:
+        narrative_lines.append("- Binary response handling: ranked on the selected/yes-style response only.")
+    narrative_lines.append("- Values shown are percentage-point differences vs national total respondents.")
+
+    chart_values: list[dict[str, Any]] = []
+    for idx, row in enumerate(ranked, start=1):
+        chart_values.append(
+            {
+                "rank": idx,
+                "response_option": _truncate_label(row["response_option"], 42),
+                "target_percent": round(row["target_percent"], 2),
+                "national_percent": round(row["national_percent"], 2),
+                "delta_points": round(row["delta_points"], 2),
+                "abs_delta_points": round(row["abs_delta_points"], 2),
+                "combined_moe_points": (
+                    round(row["combined_moe_points"], 2)
+                    if row["combined_moe_points"] is not None
+                    else None
+                ),
+                "significant": "Significant" if row["is_significant"] else "Not significant",
+            }
+        )
+
+    max_abs = max(abs(v["delta_points"]) for v in chart_values)
+    max_abs = max(max_abs, 1.0)
+    chart_spec: dict[str, Any] = {
+        "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+        "title": {
+            "text": f"{operator_label} Differences vs National",
+            "subtitle": f"{target_label} · {question_ref}",
+            "anchor": "start",
+        },
+        "data": {"values": chart_values},
+        "height": {"step": 28},
+        "layer": [
+            {
+                "mark": {"type": "bar", "cornerRadiusEnd": 4},
+                "encoding": {
+                    "color": {
+                        "field": "significant",
+                        "type": "nominal",
+                        "scale": {
+                            "domain": ["Significant", "Not significant"],
+                            "range": [_BRAND_BLUE, _BRAND_BLUE_LIGHT],
+                        },
+                        "legend": {"orient": "bottom"},
+                    },
+                },
+            },
+            {
+                "mark": {
+                    "type": "rule",
+                    "color": "#9ca3af",
+                    "strokeDash": [3, 3],
+                },
+                "encoding": {"x": {"datum": 0}},
+            },
+            {
+                "mark": {
+                    "type": "text",
+                    "fontSize": 11,
+                    "fontWeight": 500,
+                    "dx": 4,
+                },
+                "encoding": {
+                    "text": {"field": "delta_points", "type": "quantitative", "format": "+.1f"},
+                    "align": {
+                        "condition": {"test": "datum.delta_points < 0", "value": "right"},
+                        "value": "left",
+                    },
+                    "dx": {
+                        "condition": {"test": "datum.delta_points < 0", "value": -4},
+                        "value": 4,
+                    },
+                    "color": {"value": "#374151"},
+                },
+            },
+        ],
+        "encoding": {
+            "y": {
+                "field": "response_option",
+                "type": "nominal",
+                "sort": {"field": "rank", "order": "ascending"},
+                "title": None,
+                "axis": {"labelLimit": 320, "labelFontSize": 12},
+            },
+            "x": {
+                "field": "delta_points",
+                "type": "quantitative",
+                "title": "Delta vs National (pts)",
+                "scale": {"domain": [-(max_abs * 1.2), max_abs * 1.2]},
+                "axis": {"grid": True, "format": "+.0f"},
+            },
+            "tooltip": [
+                {"field": "response_option", "type": "nominal", "title": "Response"},
+                {"field": "target_percent", "type": "quantitative", "title": f"{target_label} %", "format": ".1f"},
+                {"field": "national_percent", "type": "quantitative", "title": "National %", "format": ".1f"},
+                {"field": "delta_points", "type": "quantitative", "title": "Delta (pts)", "format": "+.1f"},
+                {"field": "combined_moe_points", "type": "quantitative", "title": "Combined MOE (pts)", "format": ".2f"},
+                {"field": "significant", "type": "nominal", "title": "Significance"},
+            ],
+        },
+        "config": _CHART_CONFIG,
+    }
+
+    return {
+        "analysis_type": "extreme_difference_by_baseline",
+        "question_id": question_id,
+        "question_group": question_group,
+        "question_text": question_text,
+        "demo_id": demo_id,
+        "target_demo_level": target_demo_level,
+        "baseline_demo_level": "TOTAL: Total respondents",
+        "operator": operator,
+        "operator_label": operator_label,
+        "row_count": len(chart_values),
+        "significant_count": significant_count,
+        "top_rows": chart_values,
+        "sql": sql.strip(),
+        "insight_text": "\n".join(narrative_lines),
+        "chart": chart_spec,
+    }
 
 
 _ANSWERABILITY_GENERIC_TOKENS = {
@@ -1482,6 +2197,18 @@ def build_unanswerable_result_for_user_query(
 
 def _build_quick_insight(question: str, demo_level: str | None = None, top_n: int = 8) -> dict[str, Any]:
     """Fast path: search question -> fetch top response options -> create chart spec."""
+    extreme_request = _resolve_extreme_difference_request(question)
+    if extreme_request:
+        extreme = _build_extreme_difference_by_demographic(
+            question=str(extreme_request["question"]),
+            demo_id=str(extreme_request["demo_id"]),
+            target_demo_level=str(extreme_request["target_demo_level"]),
+            operator=str(extreme_request.get("operator", "most_different")),
+            top_n=min(top_n, 10),
+        )
+        if "error" not in extreme:
+            return extreme
+
     room_route = _resolve_room_intent_group(question)
     if room_route:
         return _build_top_selected_for_question_group(
@@ -2606,6 +3333,18 @@ def build_direct_result_for_user_query(user_message: str) -> dict[str, Any] | No
     breakout_terms = ("breakout", "break down", "breakdown", "distribution", "split", "mix")
     has_breakout_intent = any(t in q for t in breakout_terms)
     has_compare_intent = _has_comparison_intent(q)
+
+    extreme_request = _resolve_extreme_difference_request(cleaned)
+    if extreme_request:
+        extreme = _build_extreme_difference_by_demographic(
+            question=str(extreme_request["question"]),
+            demo_id=str(extreme_request["demo_id"]),
+            target_demo_level=str(extreme_request["target_demo_level"]),
+            operator=str(extreme_request.get("operator", "most_different")),
+            top_n=10,
+        )
+        if "error" not in extreme:
+            return extreme
 
     room_route = _resolve_room_intent_group(cleaned)
     if room_route:
