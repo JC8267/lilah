@@ -160,33 +160,22 @@ def _intent_boost(query_tokens: set[str], row: dict[str, Any]) -> float:
 
 
 def _build_semantic_index() -> None:
-    """Build an in-memory TF-IDF semantic index over question metadata + aliases."""
+    """Build an in-memory TF-IDF semantic index over question metadata."""
     global _semantic_index
     con = get_connection()
 
+    # Keep startup memory use low by avoiding a full scan/group-by over survey_long.
     rows = con.execute("""
-        WITH aliases AS (
-            SELECT
-                question_id,
-                STRING_AGG(DISTINCT question_level, ' | ') AS question_levels,
-                STRING_AGG(DISTINCT response_option, ' | ') AS response_options
-            FROM survey_long
-            WHERE (question_level IS NOT NULL AND TRIM(question_level) <> '')
-               OR (response_option IS NOT NULL AND TRIM(response_option) <> '')
-            GROUP BY question_id
-        )
         SELECT
-            qc.question_id,
-            qc.question_group,
-            qc.question_text,
-            qc.has_question_level,
-            qc.response_option_count,
-            qc.demo_break_count,
-            COALESCE(a.question_levels, '') AS question_levels,
-            COALESCE(a.response_options, '') AS response_options
-        FROM question_catalog qc
-        LEFT JOIN aliases a
-          ON qc.question_id = a.question_id
+            question_id,
+            question_group,
+            question_text,
+            has_question_level,
+            response_option_count,
+            demo_break_count,
+            '' AS question_levels,
+            '' AS response_options
+        FROM question_catalog
     """).fetchall()
 
     docs: list[dict[str, Any]] = []
@@ -332,34 +321,35 @@ def get_connection() -> duckdb.DuckDBPyConnection:
 
 
 def init_duckdb() -> None:
-    """Load CSVs into in-memory DuckDB tables."""
+    """Expose CSVs via DuckDB views (low-memory mode for small Render instances)."""
     global _con, _semantic_index
-    _con = duckdb.connect(":memory:")
+    _con = duckdb.connect()
 
     survey_path = settings.data_dir / "survey_long.csv"
     catalog_path = settings.data_dir / "question_catalog.csv"
 
+    survey_csv = survey_path.as_posix().replace("'", "''")
+    catalog_csv = catalog_path.as_posix().replace("'", "''")
+
+    # Constrain memory and allow spill to disk in constrained runtime environments.
+    _con.execute("PRAGMA memory_limit='256MB'")
+    _con.execute("PRAGMA threads=2")
+    _con.execute("PRAGMA temp_directory='/tmp'")
+
     _con.execute(f"""
-        CREATE TABLE survey_long AS
-        SELECT * FROM read_csv_auto('{survey_path.as_posix()}',
-                                     header=true, sample_size=-1)
+        CREATE OR REPLACE VIEW survey_long AS
+        SELECT * FROM read_csv_auto('{survey_csv}', header=true, sample_size=10000)
     """)
 
     _con.execute(f"""
-        CREATE TABLE question_catalog AS
-        SELECT * FROM read_csv_auto('{catalog_path.as_posix()}',
-                                     header=true)
+        CREATE OR REPLACE VIEW question_catalog AS
+        SELECT * FROM read_csv_auto('{catalog_csv}', header=true, sample_size=10000)
     """)
 
-    # Create indexes for common query patterns
-    _con.execute("CREATE INDEX idx_sl_qid ON survey_long(question_id)")
-    _con.execute("CREATE INDEX idx_sl_demo ON survey_long(demo_id)")
-
-    row_count = _con.execute("SELECT COUNT(*) FROM survey_long").fetchone()[0]
     q_count = _con.execute("SELECT COUNT(*) FROM question_catalog").fetchone()[0]
     _build_semantic_index()
     sem_count = int((_semantic_index or {}).get("doc_count", 0))
-    print(f"DuckDB ready: {row_count:,} survey rows, {q_count:,} questions")
+    print(f"DuckDB ready (CSV views): {q_count:,} questions")
     print(f"Semantic index ready: {sem_count:,} question docs")
 
 
