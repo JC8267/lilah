@@ -287,6 +287,17 @@ def _score_question_match(query: str, candidate: dict[str, Any]) -> float:
     if housing_type_intent and "household" in cand_text:
         score -= 5.0
 
+    if _is_age_demographic_intent(query_text) and any(
+        x in cand_text
+        for x in (
+            "square footage",
+            "approximate square footage",
+            "average size",
+            "bedroom(s)",
+        )
+    ):
+        score -= 10.0
+
     return score
 
 
@@ -403,6 +414,24 @@ def _is_housing_type_breakout_intent(text: str) -> bool:
     return has_home_context and has_type_context and has_living_context
 
 
+def _is_age_demographic_intent(text: str) -> bool:
+    q = (text or "").lower()
+    has_age = bool(re.search(r"\bage\b", q))
+    if not has_age:
+        return False
+    # Do not hijack child-age phrasing that maps to household-children questions.
+    if "children" in q and "household" in q:
+        return False
+    return True
+
+
+def _is_age_homeownership_intent(text: str) -> bool:
+    q = (text or "").lower()
+    return _is_age_demographic_intent(q) and any(
+        t in q for t in ("homeowner", "home ownership", "renter", "own home", "owns home")
+    )
+
+
 def _has_comparison_intent(text: str) -> bool:
     q = (text or "").lower()
     return any(
@@ -505,6 +534,14 @@ def _resolve_demo_id_from_text(text: str) -> str | None:
 
 def _build_quick_insight(question: str, demo_level: str | None = None, top_n: int = 8) -> dict[str, Any]:
     """Fast path: search question -> fetch top response options -> create chart spec."""
+    if _is_age_homeownership_intent(question):
+        return _build_demographic_breakout(
+            demo_ids=["TOTAL: Age", "TOTAL: Home Ownership"],
+            top_n=8,
+        )
+    if _is_age_demographic_intent(question):
+        return _build_demographic_breakout(demo_ids=["TOTAL: Age"], top_n=8)
+
     if _is_housing_type_breakout_intent(question):
         return _build_demographic_breakout(demo_ids=["TOTAL: Housing Type"], top_n=8)
 
@@ -1616,6 +1653,17 @@ def build_direct_result_for_user_query(user_message: str) -> dict[str, Any] | No
     if has_income and has_children:
         return _build_demographic_breakout(
             demo_ids=["TOTAL: Income", "TOTAL: Children in Household"],
+            top_n=8,
+        )
+
+    if _is_age_homeownership_intent(cleaned):
+        return _build_demographic_breakout(
+            demo_ids=["TOTAL: Age", "TOTAL: Home Ownership"],
+            top_n=8,
+        )
+    if _is_age_demographic_intent(cleaned):
+        return _build_demographic_breakout(
+            demo_ids=["TOTAL: Age"],
             top_n=8,
         )
 
