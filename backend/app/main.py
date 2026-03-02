@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.db.duckdb_engine import init_duckdb, close_duckdb
 from app.db.sqlite_store import init_sqlite
+from app.config import settings
 from app.routes import chat, conversations, metadata
 
 
@@ -23,9 +24,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Lilah", version="0.1.0", lifespan=lifespan)
 
+allowed_origins = [
+    origin.strip() for origin in settings.cors_allowed_origins.split(",") if origin.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=allowed_origins,
+    allow_origin_regex=(settings.cors_allow_origin_regex or None),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

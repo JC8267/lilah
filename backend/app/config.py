@@ -22,6 +22,8 @@ class Settings(BaseSettings):
     data_dir: Path = BACKEND_ROOT.parent / "normalized"
     sqlite_path: Path = BACKEND_ROOT / "lilah.db"
     max_query_rows: int = 200
+    cors_allowed_origins: str = "http://localhost:5173,http://localhost:3000"
+    cors_allow_origin_regex: str = r"https://.*\.vercel\.app"
 
     model_config = {
         "env_file": str(BACKEND_ROOT / ".env"),
