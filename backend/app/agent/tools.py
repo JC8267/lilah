@@ -317,6 +317,15 @@ def _score_question_match(query: str, candidate: dict[str, Any]) -> float:
         ):
             score -= 8.0
 
+    if _is_planned_purchase_intent(query_text):
+        if any(x in cand_text for x in ("planning to purchase", "plan to purchase")):
+            score += 5.0
+        if "obstacles" in cand_text:
+            score -= 6.0
+        room_hint = _extract_room_hint(query_text)
+        if room_hint and room_hint in cand_text:
+            score += 3.0
+
     return score
 
 
@@ -479,6 +488,216 @@ def _is_home_size_intent(text: str) -> bool:
     return has_home_context and has_size_context and not _is_bedroom_size_intent(q)
 
 
+def _is_planned_purchase_intent(text: str) -> bool:
+    q = (text or "").lower()
+    has_purchase = any(t in q for t in ("purchase", "purchases", "buy", "buying"))
+    has_plan = any(t in q for t in ("plan", "planned", "planning", "next 12 months"))
+    return has_purchase and has_plan
+
+
+def _extract_room_hint(text: str) -> str | None:
+    q = (text or "").lower()
+    if any(t in q for t in ("kitchen", "kitchens")):
+        return "kitchen"
+    if any(t in q for t in ("bedroom", "bedrooms")):
+        return "bedroom"
+    if any(t in q for t in ("bathroom", "bathrooms")):
+        return "bathroom"
+    if any(t in q for t in ("dining room", "dining")):
+        return "dining"
+    if any(t in q for t in ("living room", "main area", "family room")):
+        return "living"
+    return None
+
+
+def _resolve_planned_purchase_group(text: str) -> dict[str, str] | None:
+    if not _is_planned_purchase_intent(text):
+        return None
+
+    room_hint = _extract_room_hint(text)
+    if not room_hint:
+        return None
+
+    room_sql = _escape_sql_literal(room_hint)
+    sql = f"""
+        SELECT
+            question_group,
+            MIN(question_text) AS question_text,
+            COUNT(*) AS n_rows
+        FROM question_catalog
+        WHERE LOWER(question_text) LIKE '%plan%'
+          AND LOWER(question_text) LIKE '%purchase%'
+          AND LOWER(question_text) LIKE '%select all that apply%'
+          AND LOWER(question_text) LIKE '%{room_sql}%'
+        GROUP BY question_group
+        ORDER BY n_rows DESC, question_group
+        LIMIT 1
+    """
+    result = execute_query(sql)
+    if "error" in result:
+        return None
+    rows = result.get("rows", [])
+    if not rows:
+        return None
+    return {
+        "question_group": str(rows[0][0]),
+        "question_text": str(rows[0][1]),
+        "room_hint": room_hint,
+    }
+
+
+def _build_top_selected_for_question_group(
+    *,
+    question_group: str,
+    question_text: str,
+    room_hint: str,
+    top_n: int = 10,
+) -> dict[str, Any]:
+    top_n = max(3, min(int(top_n), 20))
+    qg_sql = _escape_sql_literal(question_group)
+
+    option_sql = f"""
+        SELECT DISTINCT response_option
+        FROM survey_long
+        WHERE question_group = '{qg_sql}'
+          AND response_option IS NOT NULL
+          AND TRIM(response_option) <> ''
+          AND demo_id = 'Total'
+          AND demo_level = 'TOTAL: Total respondents'
+        ORDER BY response_option
+    """
+    option_result = execute_query(option_sql)
+    if "error" in option_result:
+        return {"error": option_result["error"], "question_group": question_group}
+
+    options = [str(r[0]).strip() for r in option_result.get("rows", []) if r and str(r[0]).strip()]
+    preferred = _pick_preferred_binary_response_option(options)
+    if not preferred:
+        return {
+            "error": "Could not find a selected/yes-style response option for this question group.",
+            "question_group": question_group,
+        }
+
+    pref_sql = _escape_sql_literal(preferred)
+    data_sql = f"""
+        SELECT
+            COALESCE(NULLIF(TRIM(question_level), ''), question_id) AS item,
+            100.0 * AVG(TRY_CAST(response_value AS DOUBLE)) AS percent
+        FROM survey_long
+        WHERE question_group = '{qg_sql}'
+          AND LOWER(response_option) = LOWER('{pref_sql}')
+          AND demo_id = 'Total'
+          AND demo_level = 'TOTAL: Total respondents'
+        GROUP BY item
+        ORDER BY percent DESC
+        LIMIT {top_n}
+    """
+    data_result = execute_query(data_sql)
+    if "error" in data_result:
+        return {"error": data_result["error"], "question_group": question_group}
+
+    rows = data_result.get("rows", [])
+    if not rows:
+        return {
+            "error": "No selected-item rows returned for planned-purchase group.",
+            "question_group": question_group,
+        }
+
+    chart_values = []
+    for row in rows:
+        item = str(row[0]).strip()
+        try:
+            pct = float(row[1])
+        except (TypeError, ValueError):
+            continue
+        chart_values.append({"item": _truncate_label(item, 42), "percent": round(pct, 2)})
+
+    if not chart_values:
+        return {
+            "error": "No numeric selected-item values available for planned purchases.",
+            "question_group": question_group,
+        }
+
+    top1 = chart_values[0]
+    top2 = chart_values[1] if len(chart_values) > 1 else None
+    top3_sum = sum(v["percent"] for v in chart_values[:3])
+    spread = top1["percent"] - chart_values[-1]["percent"]
+
+    title_room = room_hint.capitalize()
+    chart_spec: dict[str, Any] = {
+        "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+        "title": {
+            "text": f"Top Planned Purchases — {title_room}",
+            "subtitle": f"{question_group} · Response basis: {preferred}",
+            "anchor": "start",
+        },
+        "data": {"values": chart_values},
+        "height": {"step": 28},
+        "encoding": {
+            "y": {
+                "field": "item",
+                "type": "nominal",
+                "sort": "-x",
+                "title": None,
+                "axis": {"labelLimit": 320, "labelFontSize": 12},
+            },
+            "x": {
+                "field": "percent",
+                "type": "quantitative",
+                "title": "% selected",
+                "axis": {"format": ".0f", "grid": True},
+            },
+            "tooltip": [
+                {"field": "item", "type": "nominal", "title": "Planned purchase"},
+                {"field": "percent", "type": "quantitative", "title": "% selected", "format": ".1f"},
+            ],
+        },
+        "layer": [
+            {"mark": {"type": "bar", "cornerRadiusEnd": 4, "color": _BRAND_BLUE}},
+            {
+                "mark": {
+                    "type": "text",
+                    "align": "left",
+                    "dx": 4,
+                    "fontSize": 11,
+                    "fontWeight": 500,
+                    "color": "#374151",
+                },
+                "encoding": {
+                    "text": {"field": "percent", "type": "quantitative", "format": ".1f"}
+                },
+            },
+        ],
+        "config": _CHART_CONFIG,
+    }
+
+    lines = [
+        f"**{question_group} — {question_text}**",
+        f"- Top planned purchase: **{top1['item']}** at **{top1['percent']:.2f}%** selected.",
+    ]
+    if top2:
+        lines.append(
+            f"- Runner-up: **{top2['item']}** at **{top2['percent']:.2f}%** "
+            f"({top1['percent'] - top2['percent']:.2f} pts behind)."
+        )
+    lines.append(f"- Concentration: top 3 items sum to **{top3_sum:.2f}%**.")
+    lines.append(f"- Spread across shown items: **{spread:.2f} pts**.")
+    lines.append(f"- Response basis: **{preferred}** among total respondents.")
+
+    return {
+        "analysis_type": "top_planned_purchases",
+        "question_group": question_group,
+        "question_text": question_text,
+        "room_hint": room_hint,
+        "selected_response_option": preferred,
+        "row_count": len(chart_values),
+        "top_rows": chart_values,
+        "sql": data_sql.strip(),
+        "insight_text": "\n".join(lines),
+        "chart": chart_spec,
+    }
+
+
 def _pick_home_size_question_match(matches: list[dict[str, Any]]) -> dict[str, Any] | None:
     for candidate in matches:
         text = str(candidate.get("question_text", "")).lower()
@@ -619,6 +838,15 @@ def _resolve_demo_id_from_text(text: str) -> str | None:
 
 def _build_quick_insight(question: str, demo_level: str | None = None, top_n: int = 8) -> dict[str, Any]:
     """Fast path: search question -> fetch top response options -> create chart spec."""
+    planned_group = _resolve_planned_purchase_group(question)
+    if planned_group:
+        return _build_top_selected_for_question_group(
+            question_group=planned_group["question_group"],
+            question_text=planned_group["question_text"],
+            room_hint=planned_group["room_hint"],
+            top_n=min(top_n, 12),
+        )
+
     if _is_age_homeownership_intent(question):
         return _build_demographic_breakout(
             demo_ids=["TOTAL: Age", "TOTAL: Home Ownership"],
@@ -1723,6 +1951,15 @@ def build_direct_result_for_user_query(user_message: str) -> dict[str, Any] | No
     breakout_terms = ("breakout", "break down", "breakdown", "distribution", "split", "mix")
     has_breakout_intent = any(t in q for t in breakout_terms)
     has_compare_intent = _has_comparison_intent(q)
+
+    planned_group = _resolve_planned_purchase_group(cleaned)
+    if planned_group:
+        return _build_top_selected_for_question_group(
+            question_group=planned_group["question_group"],
+            question_text=planned_group["question_text"],
+            room_hint=planned_group["room_hint"],
+            top_n=10,
+        )
 
     has_income = "income" in q
     has_children = (
