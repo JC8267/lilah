@@ -91,13 +91,16 @@ class AnthropicProvider(BaseProvider):
     ) -> ModelTurn:
         _ = timeout_seconds  # Anthropic SDK handles its own timeout configuration.
 
-        response = self._client.messages.create(
-            model=model_id,
-            max_tokens=max_tokens,
-            system=system_prompt,
-            tools=tools,
-            messages=self._to_anthropic_messages(history),
-        )
+        payload: dict[str, Any] = {
+            "model": model_id,
+            "max_tokens": max_tokens,
+            "system": system_prompt,
+            "messages": self._to_anthropic_messages(history),
+        }
+        if tools:
+            payload["tools"] = tools
+
+        response = self._client.messages.create(**payload)
 
         text_parts: list[str] = []
         tool_calls: list[ToolCall] = []
@@ -187,9 +190,10 @@ class OpenAICompatibleProvider(BaseProvider):
                 {"role": "system", "content": system_prompt},
                 *self._to_openai_messages(history),
             ],
-            "tools": self._to_openai_tools(tools),
-            "tool_choice": "auto",
         }
+        if tools:
+            payload["tools"] = self._to_openai_tools(tools)
+            payload["tool_choice"] = "auto"
 
         body = json.dumps(payload).encode("utf-8")
         headers = {"Content-Type": "application/json"}

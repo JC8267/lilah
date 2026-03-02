@@ -18,6 +18,10 @@ class Settings(BaseSettings):
     llm_retry_attempts: int = 2
     llm_retry_backoff_seconds: float = 1.0
     llm_fallback_models: str = ""  # comma-separated model IDs
+    question_match_model_assist: bool = True
+    question_match_model_top_k: int = 8
+    question_match_model_min_confidence: float = 0.55
+    question_match_model_timeout_seconds: float = 12.0
     chat_history_max_messages: int = 10
     data_dir: Path = BACKEND_ROOT.parent / "normalized"
     sqlite_path: Path = BACKEND_ROOT / "lilah.db"

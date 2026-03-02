@@ -6,6 +6,8 @@ import json
 import re
 from typing import Any
 
+from app.agent.provider import get_provider, resolve_runtime_options
+from app.config import settings
 from app.db.duckdb_engine import execute_query, search_questions
 
 
@@ -91,6 +93,153 @@ def _tokenize(text: str) -> list[str]:
     return [t for t in re.split(r"[^a-z0-9]+", text.lower()) if t]
 
 
+_MATCH_TOKEN_ALIASES = {
+    "homes": "home",
+    "housing": "home",
+    "houses": "house",
+    "households": "household",
+    "types": "type",
+    "kinds": "kind",
+    "people": "person",
+    "respondents": "respondent",
+}
+
+
+def _normalize_match_token(token: str) -> str:
+    t = token.lower().strip()
+    if not t:
+        return ""
+
+    t = _MATCH_TOKEN_ALIASES.get(t, t)
+    if len(t) > 4 and t.endswith("ies"):
+        t = f"{t[:-3]}y"
+    elif len(t) > 3 and t.endswith("s") and not t.endswith("ss"):
+        t = t[:-1]
+    return _MATCH_TOKEN_ALIASES.get(t, t)
+
+
+def _tokenize_for_match(text: str) -> list[str]:
+    out: list[str] = []
+    for token in _tokenize(text):
+        normalized = _normalize_match_token(token)
+        if normalized:
+            out.append(normalized)
+    return out
+
+
+def _extract_json_dict(text: str) -> dict[str, Any] | None:
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    match = re.search(r"\{[\s\S]*\}", raw)
+    if not match:
+        return None
+
+    try:
+        parsed = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _model_assisted_question_decision(
+    query: str,
+    matches: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if not settings.question_match_model_assist or not matches:
+        return None
+
+    try:
+        top_k = max(3, min(int(settings.question_match_model_top_k), 20))
+    except Exception:
+        top_k = 8
+    candidates = matches[:top_k]
+
+    try:
+        llm_options = resolve_runtime_options(None)
+        provider = get_provider(llm_options)
+    except Exception:
+        return None
+
+    inferred_demo_id = _resolve_demo_id_from_keywords(query)
+    payload = {
+        "query": query,
+        "inferred_demo_id": inferred_demo_id,
+        "candidates": [
+            {
+                "rank": i + 1,
+                "question_id": str(c.get("question_id", "")),
+                "question_group": str(c.get("question_group", "")),
+                "question_text": str(c.get("question_text", "")),
+                "match_score": c.get("match_score"),
+            }
+            for i, c in enumerate(candidates)
+        ],
+    }
+
+    system_prompt = (
+        "You are a strict classifier for survey-question retrieval. "
+        "Choose the best candidate ONLY from provided candidates. "
+        "If the user intent is a demographic distribution request (for example housing type), "
+        "set intent to demographic_breakout and provide selected_demo_id when possible. "
+        "Prefer semantic fit over token overlap and avoid household-size questions for housing-type asks. "
+        "Return JSON only with keys: intent, selected_question_id, selected_demo_id, confidence, reason. "
+        "intent must be one of: question, demographic_breakout, unclear."
+    )
+
+    timeout_seconds = max(
+        2.0,
+        min(
+            float(settings.question_match_model_timeout_seconds),
+            float(llm_options.timeout_seconds),
+        ),
+    )
+
+    try:
+        turn = provider.run_turn(
+            system_prompt=system_prompt,
+            tools=[],
+            history=[{"role": "user", "content": json.dumps(payload, ensure_ascii=True)}],
+            model_id=llm_options.model_id,
+            max_tokens=min(512, llm_options.max_tokens),
+            timeout_seconds=timeout_seconds,
+        )
+    except Exception:
+        return None
+
+    parsed = _extract_json_dict(turn.text)
+    if not parsed:
+        return None
+
+    intent = str(parsed.get("intent", "question")).strip().lower()
+    if intent not in {"question", "demographic_breakout", "unclear"}:
+        intent = "unclear"
+
+    raw_qid = parsed.get("selected_question_id")
+    selected_question_id = raw_qid.strip() if isinstance(raw_qid, str) else ""
+    raw_demo = parsed.get("selected_demo_id")
+    selected_demo_id = raw_demo.strip() if isinstance(raw_demo, str) else ""
+    try:
+        confidence = float(parsed.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+
+    return {
+        "intent": intent,
+        "selected_question_id": selected_question_id,
+        "selected_demo_id": selected_demo_id,
+        "confidence": max(0.0, min(confidence, 1.0)),
+        "reason": str(parsed.get("reason", "")),
+    }
+
+
 def _score_question_match(query: str, candidate: dict[str, Any]) -> float:
     query_text = query.lower()
     cand_text = " ".join(
@@ -100,9 +249,11 @@ def _score_question_match(query: str, candidate: dict[str, Any]) -> float:
             str(candidate.get("question_id", "")),
         ]
     ).lower()
-    cand_tokens = set(_tokenize(cand_text))
+    cand_tokens = set(_tokenize_for_match(cand_text))
     q_tokens = [
-        t for t in _tokenize(query_text) if len(t) >= 3 and t not in _QUESTION_STOPWORDS
+        t
+        for t in _tokenize_for_match(query_text)
+        if len(t) >= 3 and t not in _QUESTION_STOPWORDS
     ]
 
     score = 0.0
@@ -128,6 +279,14 @@ def _score_question_match(query: str, candidate: dict[str, Any]) -> float:
     ):
         score -= 8.0
 
+    # Disfavor household-count demographics for housing-type asks.
+    housing_type_intent = (
+        any(t in query_text for t in ("home", "homes", "housing"))
+        and any(t in query_text for t in ("type", "types", "kind", "kinds"))
+    )
+    if housing_type_intent and "household" in cand_text:
+        score -= 5.0
+
     return score
 
 
@@ -145,6 +304,46 @@ def _pick_best_question_match(query: str, matches: list[dict[str, Any]]) -> dict
     if best_score <= 0:
         return matches[0]
     return matches[best_idx]
+
+
+def _select_question_match_and_route(
+    query: str,
+    matches: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if not matches:
+        return None, None
+
+    heuristic_best = _pick_best_question_match(query, matches) or matches[0]
+
+    decision = _model_assisted_question_decision(query, matches)
+    try:
+        min_conf = float(settings.question_match_model_min_confidence)
+    except Exception:
+        min_conf = 0.55
+    min_conf = max(0.0, min(min_conf, 1.0))
+
+    if (
+        not isinstance(decision, dict)
+        or float(decision.get("confidence", 0.0)) < min_conf
+    ):
+        return heuristic_best, None
+
+    intent = str(decision.get("intent", "question")).strip().lower()
+    if intent == "demographic_breakout":
+        demo_id = str(decision.get("selected_demo_id", "")).strip()
+        if not demo_id:
+            demo_id = _resolve_demo_id_from_keywords(query) or ""
+        if demo_id:
+            return None, demo_id
+
+    if intent == "question":
+        selected_qid = str(decision.get("selected_question_id", "")).strip()
+        if selected_qid:
+            for candidate in matches:
+                if str(candidate.get("question_id", "")).strip() == selected_qid:
+                    return candidate, None
+
+    return heuristic_best, None
 
 
 def _is_matrix_ownership_intent(text: str) -> bool:
@@ -196,6 +395,29 @@ def _pick_preferred_binary_response_option(options: list[str]) -> str | None:
     return None
 
 
+def _is_housing_type_breakout_intent(text: str) -> bool:
+    q = (text or "").lower()
+    has_home_context = any(t in q for t in ("home", "homes", "housing", "house", "houses"))
+    has_type_context = any(t in q for t in ("type", "types", "kind", "kinds"))
+    has_living_context = any(t in q for t in ("live", "living", "reside", "residing"))
+    return has_home_context and has_type_context and has_living_context
+
+
+def _has_comparison_intent(text: str) -> bool:
+    q = (text or "").lower()
+    return any(
+        marker in q
+        for marker in (
+            " differ ",
+            " difference ",
+            " compare ",
+            " compared ",
+            " versus ",
+            " vs ",
+        )
+    )
+
+
 DEMO_KEYWORD_TO_ID: list[tuple[str, str]] = [
     ("children in household", "TOTAL: Children in Household"),
     ("kids in household", "TOTAL: Children in Household"),
@@ -213,6 +435,12 @@ DEMO_KEYWORD_TO_ID: list[tuple[str, str]] = [
     ("renter", "TOTAL: Home Ownership"),
     ("housing type", "TOTAL: Housing Type"),
     ("home type", "TOTAL: Housing Type"),
+    ("type of home", "TOTAL: Housing Type"),
+    ("type of homes", "TOTAL: Housing Type"),
+    ("types of home", "TOTAL: Housing Type"),
+    ("types of homes", "TOTAL: Housing Type"),
+    ("kind of home", "TOTAL: Housing Type"),
+    ("kinds of homes", "TOTAL: Housing Type"),
     ("customer type", "TOTAL: Customer Type"),
     ("area type", "TOTAL: Area Type"),
     ("work from home", "TOTAL: Work From Home Frequency"),
@@ -220,13 +448,28 @@ DEMO_KEYWORD_TO_ID: list[tuple[str, str]] = [
 ]
 
 
-def _resolve_demo_id_from_text(text: str) -> str | None:
-    q = text.lower()
+def _resolve_demo_id_from_keywords(text: str) -> str | None:
+    if _is_housing_type_breakout_intent(text):
+        return "TOTAL: Housing Type"
+    q = (text or "").lower()
+    if any(t in q for t in ("apartment", "apartments")) and any(
+        t in q for t in ("home", "homes", "house", "houses")
+    ):
+        return "TOTAL: Housing Type"
+
     for keyword, demo_id in DEMO_KEYWORD_TO_ID:
         if keyword in q:
             return demo_id
+    return None
+
+
+def _resolve_demo_id_from_text(text: str) -> str | None:
+    exact = _resolve_demo_id_from_keywords(text)
+    if exact:
+        return exact
 
     # Fallback: fuzzy match against available demo_id values in survey_long.
+    q = (text or "").lower()
     tokens = [
         t
         for t in re.split(r"[^a-z0-9]+", q)
@@ -262,6 +505,9 @@ def _resolve_demo_id_from_text(text: str) -> str | None:
 
 def _build_quick_insight(question: str, demo_level: str | None = None, top_n: int = 8) -> dict[str, Any]:
     """Fast path: search question -> fetch top response options -> create chart spec."""
+    if _is_housing_type_breakout_intent(question):
+        return _build_demographic_breakout(demo_ids=["TOTAL: Housing Type"], top_n=8)
+
     search_result = search_questions(question)
     if "error" in search_result:
         return {"error": search_result["error"]}
@@ -270,7 +516,10 @@ def _build_quick_insight(question: str, demo_level: str | None = None, top_n: in
     if not matches:
         return {"error": "No matching questions found."}
 
-    best = _pick_best_question_match(question, matches) or matches[0]
+    best, routed_demo_id = _select_question_match_and_route(question, matches)
+    if routed_demo_id:
+        return _build_demographic_breakout(demo_ids=[routed_demo_id], top_n=8)
+    best = best or matches[0]
     question_id = str(best.get("question_id", "")).strip()
     question_text = str(best.get("question_text", "")).strip()
     if not question_id:
@@ -287,12 +536,13 @@ def _build_quick_insight(question: str, demo_level: str | None = None, top_n: in
     sql = f"""
         SELECT
             response_option,
-            AVG(CAST(response_value AS DOUBLE)) AS response_value
+            AVG(TRY_CAST(response_value AS DOUBLE)) AS response_value
         FROM survey_long
         WHERE question_id = '{qid_sql}'
           AND {demo_sql}
           AND response_option IS NOT NULL
           AND TRIM(response_option) <> ''
+          AND TRY_CAST(response_value AS DOUBLE) IS NOT NULL
         GROUP BY response_option
         ORDER BY response_value DESC
         LIMIT {top_n}
@@ -683,7 +933,8 @@ def _build_question_by_demographic(
     if not matches:
         return {"error": "No matching questions found for cross-tab."}
 
-    best = _pick_best_question_match(question, matches) or matches[0]
+    best, _ = _select_question_match_and_route(question, matches)
+    best = best or matches[0]
     question_id = str(best.get("question_id", "")).strip()
     question_text = str(best.get("question_text", "")).strip()
     if not question_id:
@@ -1061,7 +1312,8 @@ def _build_question_group_by_demographic(
     if not matches:
         return {"error": "No matching question group found for matrix cross-tab."}
 
-    best = _pick_best_question_match(question, matches) or matches[0]
+    best, _ = _select_question_match_and_route(question, matches)
+    best = best or matches[0]
     question_group = str(best.get("question_group", "")).strip()
     question_text = str(best.get("question_text", "")).strip()
     if not question_group:
@@ -1342,14 +1594,67 @@ def build_direct_result_for_user_query(user_message: str) -> dict[str, Any] | No
     q = cleaned.lower()
     breakout_terms = ("breakout", "break down", "breakdown", "distribution", "split", "mix")
     has_breakout_intent = any(t in q for t in breakout_terms)
+    has_compare_intent = _has_comparison_intent(q)
 
     has_income = "income" in q
-    has_children = ("children" in q and "household" in q) or "kids" in q
+    has_children = (
+        ("children" in q and "household" in q)
+        or "kids" in q
+        or "with children" in q
+        or "people with children" in q
+        or "have children" in q
+    )
+    if has_income and has_children and has_compare_intent:
+        cross = _build_question_by_demographic(
+            question="income",
+            demo_id="TOTAL: Children in Household",
+            top_n_options=5,
+        )
+        if "error" not in cross:
+            return cross
+
     if has_income and has_children:
         return _build_demographic_breakout(
             demo_ids=["TOTAL: Income", "TOTAL: Children in Household"],
             top_n=8,
         )
+
+    # Common phrasing like "What types of homes do people live in?"
+    if _is_housing_type_breakout_intent(cleaned):
+        return _build_demographic_breakout(
+            demo_ids=["TOTAL: Housing Type"],
+            top_n=8,
+        )
+
+    # Generic comparison phrasing: "<question> differ ... for <segment expr>".
+    if has_compare_intent and (" vs " in q or " versus " in q):
+        for_idx = q.rfind(" for ")
+        if for_idx != -1:
+            segment_expr = cleaned[for_idx + 5 :].strip(" ?.")
+            demo_id = _resolve_demo_id_from_text(segment_expr)
+            if demo_id:
+                base_question = cleaned[:for_idx].strip(" ?.")
+                if len(base_question) < 5:
+                    base_question = cleaned
+
+                if _is_matrix_ownership_intent(base_question):
+                    item_keywords = _extract_matrix_item_keywords(base_question)
+                    matrix = _build_question_group_by_demographic(
+                        question=base_question,
+                        demo_id=demo_id,
+                        top_n_items=24,
+                        item_keywords=item_keywords,
+                    )
+                    if "error" not in matrix:
+                        return matrix
+
+                cross = _build_question_by_demographic(
+                    question=base_question,
+                    demo_id=demo_id,
+                    top_n_options=5,
+                )
+                if "error" not in cross:
+                    return cross
 
     # Generic cross-tab path: "<question> by <demographic>"
     by_idx = q.rfind(" by ")

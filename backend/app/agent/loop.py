@@ -336,15 +336,69 @@ async def run_agent_loop(
                     break
 
         if loop_aborted and not full_text:
-            if fallback_insight_text:
-                full_text = fallback_insight_text
-            elif charts:
-                full_text = "Chart generated. Ask a narrower follow-up for a written insight."
+            # Rescue path: fall back to deterministic tool execution before returning an error-like message.
+            rescue_result = build_direct_result_for_user_query(last_user_text)
+            if isinstance(rescue_result, dict) and "error" not in rescue_result:
+                rescue_chart = rescue_result.get("chart")
+                if isinstance(rescue_chart, dict):
+                    charts.append(rescue_chart)
+                    yield {"event": "chart", "data": {"spec": rescue_chart}}
+                rescue_text = rescue_result.get("insight_text")
+                if isinstance(rescue_text, str) and rescue_text.strip():
+                    full_text = rescue_text.strip()
+                else:
+                    full_text = "Completed a deterministic fallback analysis."
             else:
-                full_text = (
-                    "I could not complete a stable analysis loop for that query. "
-                    "Please try a more specific question."
-                )
+                try:
+                    quick_raw = handle_tool_call(
+                        "quick_insight",
+                        {"question": last_user_text, "top_n": 8},
+                    )
+                    quick = json.loads(quick_raw)
+                except Exception:
+                    quick = {"error": "quick_insight fallback failed."}
+
+                if isinstance(quick, dict) and "error" not in quick:
+                    quick_chart = quick.get("chart")
+                    if isinstance(quick_chart, dict):
+                        charts.append(quick_chart)
+                        yield {"event": "chart", "data": {"spec": quick_chart}}
+                    quick_text = quick.get("insight_text")
+                    if isinstance(quick_text, str) and quick_text.strip():
+                        full_text = quick_text.strip()
+                    else:
+                        full_text = "Completed a quick fallback analysis."
+                elif fallback_insight_text:
+                    full_text = fallback_insight_text
+                elif charts:
+                    full_text = "Chart generated. Ask a narrower follow-up for a written insight."
+                else:
+                    try:
+                        sq_raw = handle_tool_call("search_questions", {"keywords": last_user_text})
+                        sq = json.loads(sq_raw)
+                    except Exception:
+                        sq = {}
+
+                    candidate_lines: list[str] = []
+                    if isinstance(sq, dict):
+                        for row in (sq.get("results") or [])[:3]:
+                            qid = str(row.get("question_id", "")).strip()
+                            qtext = str(row.get("question_text", "")).strip()
+                            if qid and qtext:
+                                candidate_lines.append(f"- {qid}: {qtext}")
+
+                    if candidate_lines:
+                        full_text = (
+                            "I could not stabilize the full tool loop, but I found close matches. "
+                            "Try one of these phrasings:\n"
+                            + "\n".join(candidate_lines)
+                        )
+                    else:
+                        full_text = (
+                            "I could not complete a stable analysis loop for that query. "
+                            "Try specifying the metric and one demographic dimension (for example: "
+                            "'How do number of stories differ by housing type?')."
+                        )
 
         if full_text and not text_emitted and not full_text.isspace():
             # Ensure clients receive at least one text chunk when only fallback text exists.

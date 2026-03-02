@@ -338,12 +338,22 @@ def init_duckdb() -> None:
 
     _con.execute(f"""
         CREATE OR REPLACE VIEW survey_long AS
-        SELECT * FROM read_csv_auto('{survey_csv}', header=true, sample_size=10000)
+        SELECT * FROM read_csv_auto(
+            '{survey_csv}',
+            header=true,
+            sample_size=10000,
+            all_varchar=true
+        )
     """)
 
     _con.execute(f"""
         CREATE OR REPLACE VIEW question_catalog AS
-        SELECT * FROM read_csv_auto('{catalog_csv}', header=true, sample_size=10000)
+        SELECT * FROM read_csv_auto(
+            '{catalog_csv}',
+            header=true,
+            sample_size=10000,
+            all_varchar=true
+        )
     """)
 
     q_count = _con.execute("SELECT COUNT(*) FROM question_catalog").fetchone()[0]
