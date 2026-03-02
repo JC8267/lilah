@@ -43,6 +43,9 @@ def _compact_tool_result_for_model(tool_name: str, result_data: Any) -> str:
 
     if tool_name == "quick_insight":
         compact = {
+            "analysis_type": result_data.get("analysis_type"),
+            "answerable": result_data.get("answerable"),
+            "reason_code": result_data.get("reason_code"),
             "question_id": result_data.get("question_id"),
             "question_text": result_data.get("question_text"),
             "row_count": result_data.get("row_count"),

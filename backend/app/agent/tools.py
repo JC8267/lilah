@@ -784,6 +784,13 @@ def _resolve_room_intent_group(text: str) -> dict[str, Any] | None:
 
     room_hint = _extract_room_hint(text)
     target_room = room_hint if room_hint in room_map else None
+    if target_room is None and room_hint:
+        if room_hint in {"home", "living"} and "main" in room_map:
+            target_room = "main"
+        elif len(room_map) > 1:
+            # For multi-room families, avoid silently falling back to an unrelated room.
+            # Example: "bathroom planned purchases" should not auto-route to "home".
+            return None
     if target_room is None:
         if "home" in room_map:
             target_room = "home"
@@ -1148,6 +1155,331 @@ def _resolve_demo_id_from_text(text: str) -> str | None:
     return str(rows[0][0])
 
 
+_ANSWERABILITY_GENERIC_TOKENS = {
+    "home",
+    "house",
+    "housing",
+    "room",
+    "area",
+    "respondent",
+    "people",
+    "person",
+    "question",
+    "survey",
+    "total",
+    "average",
+    "common",
+    "most",
+    "least",
+    "top",
+    "share",
+    "percent",
+    "percentage",
+    "number",
+    "many",
+    "much",
+    "differ",
+    "difference",
+    "compare",
+    "versu",
+    "versus",
+    "live",
+    "living",
+    "use",
+    "used",
+    "have",
+    "has",
+    "own",
+    "owned",
+}
+
+
+_ROOM_LABELS = {
+    "home": "home",
+    "main": "main area",
+    "living": "living room",
+    "bedroom": "bedroom",
+    "kitchen": "kitchen",
+    "dining": "dining room",
+    "bathroom": "bathroom",
+}
+
+
+def _room_label(room_key: str) -> str:
+    return _ROOM_LABELS.get(room_key, room_key.replace("_", " ").strip())
+
+
+def _extract_answerability_anchor_tokens(text: str) -> list[str]:
+    anchors: list[str] = []
+    for token in _tokenize_for_match(text):
+        if len(token) < 3:
+            continue
+        if token in _QUESTION_STOPWORDS:
+            continue
+        if token in _ANSWERABILITY_GENERIC_TOKENS:
+            continue
+        anchors.append(token)
+    return sorted(set(anchors))
+
+
+def _build_close_question_suggestions(
+    matches: list[dict[str, Any]],
+    limit: int = 3,
+) -> list[dict[str, Any]]:
+    suggestions: list[dict[str, Any]] = []
+    seen_keys: set[str] = set()
+
+    for row in matches:
+        qid = str(row.get("question_id", "")).strip()
+        qgroup = str(row.get("question_group", "")).strip()
+        qtext = str(row.get("question_text", "")).strip()
+        if not qid or not qtext:
+            continue
+        uniq = qgroup or qid
+        if uniq in seen_keys:
+            continue
+        seen_keys.add(uniq)
+        suggestions.append(
+            {
+                "question_id": qid,
+                "question_group": qgroup or None,
+                "question_text": qtext,
+            }
+        )
+        if len(suggestions) >= limit:
+            break
+
+    return suggestions
+
+
+def _build_not_answerable_result(
+    *,
+    query: str,
+    reason: str,
+    reason_code: str,
+    alternatives: list[dict[str, Any]] | None = None,
+    anchor_tokens: list[str] | None = None,
+    matched_anchor_tokens: list[str] | None = None,
+    top_match_score: float | None = None,
+    second_match_score: float | None = None,
+) -> dict[str, Any]:
+    alts = alternatives or []
+    anchors = anchor_tokens or []
+    matched = matched_anchor_tokens or []
+
+    lines = [
+        "I could not find a reliable, answerable match for that request in this survey data.",
+        f"- Reason: {reason}",
+    ]
+    if anchors:
+        lines.append(
+            f"- Key terms matched in top candidates: {len(matched)}/{len(anchors)} "
+            f"({', '.join(matched[:5]) if matched else 'none'})."
+        )
+    if alts:
+        lines.append("- Closest answerable questions in this dataset:")
+        for alt in alts:
+            qid = str(alt.get("question_id", "")).strip()
+            qtext = str(alt.get("question_text", "")).strip()
+            if qid and qtext:
+                lines.append(f"- {qid} — {qtext}")
+    else:
+        lines.append("- Try restating with one in-dataset topic such as rooms, furniture, purchases, or demographics.")
+
+    return {
+        "analysis_type": "not_answerable",
+        "answerable": False,
+        "query": query,
+        "reason_code": reason_code,
+        "reason": reason,
+        "anchor_tokens": anchors or None,
+        "matched_anchor_tokens": matched or None,
+        "top_match_score": round(float(top_match_score), 4) if top_match_score is not None else None,
+        "second_match_score": round(float(second_match_score), 4) if second_match_score is not None else None,
+        "alternatives": alts or None,
+        "insight_text": "\n".join(lines),
+    }
+
+
+def build_unanswerable_result_for_user_query(
+    user_message: str,
+    precomputed_matches: list[dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    """Return an abstain payload when a query is likely not answerable from this dataset."""
+    if not user_message:
+        return None
+
+    cleaned = user_message.strip()
+    if cleaned.startswith("[Active filters:"):
+        parts = cleaned.split("\n\n", 1)
+        cleaned = parts[1].strip() if len(parts) > 1 else cleaned
+    if not cleaned:
+        return None
+
+    q = cleaned.lower()
+
+    intent = _detect_room_matrix_intent(cleaned)
+    room_hint = _extract_room_hint(cleaned)
+    room_map = _ROOM_INTENT_GROUPS.get(intent, {}) if intent else {}
+    if room_hint and room_map and room_hint not in room_map:
+        if not (room_hint in {"home", "living"} and "main" in room_map):
+            if len(room_map) > 1:
+                ordered_rooms = [rk for rk in room_map.keys() if rk not in {"home"}] or list(room_map.keys())
+                alternatives: list[dict[str, Any]] = []
+                seen_groups: set[str] = set()
+                for room_key in ordered_rooms:
+                    qgroup = str(room_map.get(room_key, "")).strip()
+                    if not qgroup or qgroup in seen_groups:
+                        continue
+                    seen_groups.add(qgroup)
+                    alternatives.append(
+                        {
+                            "question_id": qgroup,
+                            "question_group": qgroup,
+                            "question_text": _resolve_group_question_text(qgroup),
+                        }
+                    )
+                    if len(alternatives) >= 3:
+                        break
+                available = ", ".join(_room_label(rk) for rk in ordered_rooms)
+                reason = (
+                    f"No '{_room_label(room_hint)}' split is available for this question family. "
+                    f"Available room splits: {available}."
+                )
+                return _build_not_answerable_result(
+                    query=cleaned,
+                    reason=reason,
+                    reason_code="unsupported_room_scope",
+                    alternatives=alternatives,
+                )
+
+    # Preserve known deterministic paths; this guard is only for uncertain retrieval.
+    if _resolve_room_intent_group(cleaned):
+        return None
+    if _is_age_homeownership_intent(cleaned):
+        return None
+    if _is_age_demographic_intent(cleaned):
+        return None
+    if _is_home_size_intent(cleaned):
+        return None
+    if _is_housing_type_breakout_intent(cleaned):
+        return None
+
+    has_income = "income" in q
+    has_children = (
+        ("children" in q and "household" in q)
+        or "kids" in q
+        or "with children" in q
+        or "people with children" in q
+        or "have children" in q
+    )
+    if has_income and has_children:
+        return None
+
+    has_compare_intent = _has_comparison_intent(q)
+    if has_compare_intent and (" vs " in q or " versus " in q):
+        for_idx = q.rfind(" for ")
+        if for_idx != -1:
+            segment_expr = cleaned[for_idx + 5 :].strip(" ?.")
+            if _resolve_demo_id_from_text(segment_expr):
+                return None
+
+    by_idx = q.rfind(" by ")
+    if by_idx != -1:
+        by_tail = cleaned[by_idx + 4 :].strip(" ?.")
+        if _resolve_demo_id_from_text(by_tail):
+            return None
+
+    matches = precomputed_matches
+    if matches is None:
+        try:
+            search_result = search_questions(cleaned)
+        except Exception:
+            return None
+        if not isinstance(search_result, dict):
+            return None
+        if "error" in search_result:
+            return None
+        matches = search_result.get("results", [])
+
+    if not matches:
+        return _build_not_answerable_result(
+            query=cleaned,
+            reason="No close question match was found in the catalog.",
+            reason_code="no_close_match",
+        )
+
+    anchors = _extract_answerability_anchor_tokens(cleaned)
+    if not anchors:
+        return None
+
+    top_window = matches[:12]
+    candidate_tokens: set[str] = set()
+    for row in top_window:
+        candidate_tokens.update(
+            _tokenize_for_match(
+                " ".join(
+                    [
+                        str(row.get("question_text", "")),
+                        str(row.get("question_group", "")),
+                        str(row.get("question_id", "")),
+                    ]
+                )
+            )
+        )
+    matched_anchors = sorted(
+        {
+            token
+            for token in anchors
+            if token in candidate_tokens
+        }
+    )
+    coverage = (len(matched_anchors) / len(anchors)) if anchors else 1.0
+
+    try:
+        top_score = float(matches[0].get("match_score", 0.0) or 0.0)
+    except Exception:
+        top_score = 0.0
+    try:
+        second_score = float(matches[1].get("match_score", 0.0) or 0.0) if len(matches) > 1 else 0.0
+    except Exception:
+        second_score = 0.0
+
+    low_confidence = False
+    if not matched_anchors:
+        if len(anchors) >= 2:
+            low_confidence = True
+        elif len(anchors) == 1 and top_score < 0.85:
+            low_confidence = True
+    elif coverage < 0.34 and top_score < 0.65:
+        low_confidence = True
+
+    if not low_confidence:
+        return None
+
+    if not matched_anchors:
+        reason = (
+            "The key topic terms in your question do not appear in the closest catalog matches."
+        )
+    else:
+        reason = (
+            f"Only {len(matched_anchors)}/{len(anchors)} key terms matched close candidates, "
+            "so the retrieval is too weak for a reliable answer."
+        )
+
+    alternatives = _build_close_question_suggestions(matches, limit=3)
+    return _build_not_answerable_result(
+        query=cleaned,
+        reason=reason,
+        reason_code="low_retrieval_confidence",
+        alternatives=alternatives,
+        anchor_tokens=anchors,
+        matched_anchor_tokens=matched_anchors,
+        top_match_score=top_score,
+        second_match_score=second_score,
+    )
+
+
 def _build_quick_insight(question: str, demo_level: str | None = None, top_n: int = 8) -> dict[str, Any]:
     """Fast path: search question -> fetch top response options -> create chart spec."""
     room_route = _resolve_room_intent_group(question)
@@ -1180,6 +1512,12 @@ def _build_quick_insight(question: str, demo_level: str | None = None, top_n: in
         return {"error": search_result["error"]}
 
     matches = search_result.get("results", [])
+    unanswerable = build_unanswerable_result_for_user_query(
+        question,
+        precomputed_matches=matches,
+    )
+    if unanswerable:
+        return unanswerable
     if not matches:
         return {"error": "No matching questions found."}
 
@@ -2412,7 +2750,7 @@ def build_direct_result_for_user_query(user_message: str) -> dict[str, Any] | No
             if "error" not in matrix:
                 return matrix
 
-    return None
+    return build_unanswerable_result_for_user_query(cleaned)
 
 
 # Tool definitions sent to model API
