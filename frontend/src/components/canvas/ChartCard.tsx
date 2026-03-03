@@ -46,7 +46,7 @@ export function ChartCard({ spec, index }: ChartCardProps) {
       </div>
       <div
         ref={containerRef}
-        className="chart-container px-4 py-5 w-full min-h-[280px] flex items-center justify-center overflow-x-auto"
+        className="chart-container px-4 py-5 w-full min-h-[280px] overflow-x-auto"
       />
     </div>
   );

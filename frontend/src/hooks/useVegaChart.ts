@@ -19,7 +19,7 @@ export function useVegaChart(spec: VegaLiteSpec | null) {
       ...specWithoutTitle,
       ...(isFaceted ? {} : {
         width: 'container' as const,
-        autosize: { type: 'fit' as const, contains: 'padding' as const },
+        autosize: { type: 'fit-x' as const, contains: 'padding' as const },
       }),
     };
 

@@ -82,8 +82,10 @@ _CHART_CONFIG: dict[str, Any] = {
     "background": "#ffffff",
     "view": {"stroke": "transparent"},
     "font": "Inter, system-ui, -apple-system, sans-serif",
+    "padding": {"left": 5, "right": 15, "top": 5, "bottom": 35},
     "axis": {
         "labelFontSize": 11,
+        "labelLimit": 350,
         "labelColor": "#4b5563",
         "titleFontSize": 12,
         "titleColor": "#374151",
@@ -1018,7 +1020,7 @@ def _build_top_selected_for_question_group(
                 "type": "nominal",
                 "sort": "-x",
                 "title": None,
-                "axis": {"labelLimit": 320, "labelFontSize": 12},
+                "axis": {"labelLimit": 400, "labelFontSize": 12},
             },
             "x": {
                 "field": "percent",
@@ -1969,7 +1971,7 @@ def _build_extreme_difference_by_demographic(
                 "type": "nominal",
                 "sort": {"field": "rank", "order": "ascending"},
                 "title": None,
-                "axis": {"labelLimit": 320, "labelFontSize": 12},
+                "axis": {"labelLimit": 400, "labelFontSize": 12},
             },
             "x": {
                 "field": "delta_points",
@@ -2301,7 +2303,7 @@ def _build_broad_differences_by_demographic(
                 "type": "nominal",
                 "sort": "-x",
                 "title": None,
-                "axis": {"labelLimit": 320},
+                "axis": {"labelLimit": 400},
             },
             "x": {
                 "field": "gap_points",
@@ -2867,7 +2869,7 @@ def _build_quick_insight(
                 "type": "nominal",
                 "sort": "-x",
                 "title": None,
-                "axis": {"labelLimit": 280, "labelFontSize": 12},
+                "axis": {"labelLimit": 350, "labelFontSize": 12},
             },
             "x": {
                 "field": "percent",
@@ -3156,7 +3158,7 @@ def _build_demographic_breakout(demo_ids: list[str], top_n: int = 8) -> dict[str
                         "type": "nominal",
                         "sort": "-x",
                         "title": None,
-                        "axis": {"labelLimit": 260, "labelFontSize": 12},
+                        "axis": {"labelLimit": 320, "labelFontSize": 12},
                     },
                     "x": {
                         "field": "percent",
@@ -3449,7 +3451,7 @@ def _build_question_by_demographic(
                     "field": "demo_level",
                     "type": "nominal",
                     "title": demo_label,
-                    "axis": {"labelLimit": 200, "labelFontSize": 11},
+                    "axis": {"labelLimit": 280, "labelFontSize": 11},
                 },
                 "x": {
                     "field": "percent",
@@ -3521,13 +3523,13 @@ def _build_question_by_demographic(
                     "field": "demo_level",
                     "type": "nominal",
                     "title": demo_label,
-                    "axis": {"labelLimit": 200, "labelFontSize": 11},
+                    "axis": {"labelLimit": 280, "labelFontSize": 11},
                 },
                 "x": {
                     "field": "response_option",
                     "type": "nominal",
                     "title": None,
-                    "axis": {"labelAngle": -30, "labelLimit": 180, "labelFontSize": 11},
+                    "axis": {"labelAngle": -30, "labelLimit": 220, "labelFontSize": 11},
                 },
                 "tooltip": [
                     {"field": "demo_level", "type": "nominal", "title": "Group"},
@@ -3790,7 +3792,7 @@ def _build_question_group_by_demographic(
                 "type": "nominal",
                 "sort": "-x",
                 "title": None,
-                "axis": {"labelLimit": 280},
+                "axis": {"labelLimit": 350},
             },
             "x": {
                 "field": "gap_points",
