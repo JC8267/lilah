@@ -803,22 +803,31 @@ def _detect_room_matrix_intent(text: str) -> str | None:
     ):
         return "activities_desired"
 
-    if any(t in q for t in ("improvement", "improvements", "changes")) and (
+    has_improvement_terms = any(t in q for t in ("improvement", "improvements", "improvment", "improvments", "changes"))
+
+    if has_improvement_terms and (
         any(t in q for t in ("made in the last 12 months", "made in last 12 months", "have you made", "already made"))
         or bool(re.search(r"\bmade\b.*\b12 months\b", q))
     ):
         return "improvements_made"
 
-    if any(
-        t in q
-        for t in (
-            "planned improvements",
-            "plan improvements",
-            "planning improvements",
-            "improvements are planned",
-            "planned changes",
-            "changes planned",
+    if has_improvement_terms and (
+        any(
+            t in q
+            for t in (
+                "planned improvements",
+                "plan improvements",
+                "planning improvements",
+                "improvements are planned",
+                "planned improvments",
+                "plan improvments",
+                "planning improvments",
+                "improvments are planned",
+                "planned changes",
+                "changes planned",
+            )
         )
+        or bool(re.search(r"\bplan\w*\b.*\bimprov\w*\b|\bimprov\w*\b.*\bplan\w*\b", q))
     ):
         return "improvements_planned"
 
@@ -1145,6 +1154,11 @@ DEMO_KEYWORD_TO_ID: list[tuple[str, str]] = [
     ("children in household", "TOTAL: Children in Household"),
     ("kids in household", "TOTAL: Children in Household"),
     ("children household", "TOTAL: Children in Household"),
+    ("living with children", "TOTAL: Children in Household"),
+    ("with children", "TOTAL: Children in Household"),
+    ("living without children", "TOTAL: Children in Household"),
+    ("without children", "TOTAL: Children in Household"),
+    ("no children", "TOTAL: Children in Household"),
     ("income", "TOTAL: Income"),
     ("age", "TOTAL: Age"),
     ("age cohort", "TOTAL: Age"),
@@ -3894,6 +3908,103 @@ def _build_question_group_by_demographic(
     }
 
 
+_SEGMENT_FILTER_MARKERS = (" for ", " among ", " amongst ")
+_SEGMENT_FILTER_CUES = (
+    "those ",
+    "people ",
+    "respondents ",
+    "households ",
+    "individuals ",
+    "adults ",
+    "customers ",
+    "consumers ",
+    "who ",
+    "with ",
+    "without ",
+    "homeowner",
+    "homeowners",
+    "owner",
+    "owners",
+    "renter",
+    "renters",
+    "children",
+    "kids",
+    "income",
+    "age",
+    "gender",
+    "ethnicity",
+    "race",
+    "region",
+    "education",
+    "urban",
+    "suburban",
+    "rural",
+    "hispanic",
+    "latino",
+    "latina",
+    "apartment",
+    "apartments",
+    "housing type",
+)
+
+
+def _looks_like_demographic_segment(segment_text: str) -> bool:
+    seg = " ".join((segment_text or "").lower().split())
+    if not seg:
+        return False
+    if _resolve_demo_id_from_keywords(seg):
+        return True
+    return any(cue in seg for cue in _SEGMENT_FILTER_CUES)
+
+
+def _extract_query_segment_active_filters(query: str) -> tuple[str, dict[str, str] | None]:
+    cleaned = (query or "").strip()
+    if not cleaned:
+        return cleaned, None
+
+    lowered = cleaned.lower()
+    split_idx = -1
+    marker_len = 0
+    for marker in _SEGMENT_FILTER_MARKERS:
+        idx = lowered.rfind(marker)
+        if idx > split_idx:
+            split_idx = idx
+            marker_len = len(marker)
+
+    if split_idx == -1:
+        return cleaned, None
+
+    base_question = cleaned[:split_idx].strip(" ?.")
+    segment_expr = cleaned[split_idx + marker_len :].strip(" ?.")
+    if len(base_question) < 5 or not segment_expr:
+        return cleaned, None
+    if not _looks_like_demographic_segment(segment_expr):
+        return cleaned, None
+
+    demo_id = _resolve_demo_id_from_text(segment_expr)
+    if not demo_id:
+        return cleaned, None
+
+    target_demo_level = _resolve_target_demo_level_for_query(demo_id, segment_expr)
+    if not target_demo_level:
+        target_demo_level = _resolve_target_demo_level_for_query(demo_id, cleaned)
+    if not target_demo_level:
+        return cleaned, None
+
+    return base_question, {demo_id: target_demo_level}
+
+
+def _resolve_effective_active_filters(
+    active_filters: dict[str, str] | None,
+    inferred_filters: dict[str, str] | None = None,
+) -> dict[str, str] | None:
+    inferred = _normalize_active_filters(inferred_filters)
+    if inferred:
+        return inferred
+    normalized = _normalize_active_filters(active_filters)
+    return normalized or None
+
+
 def build_direct_result_for_user_query(
     user_message: str,
     active_filters: dict[str, str] | None = None,
@@ -3908,6 +4019,8 @@ def build_direct_result_for_user_query(
         cleaned = parts[1].strip() if len(parts) > 1 else cleaned
 
     q = cleaned.lower()
+    routed_question, inferred_filters = _extract_query_segment_active_filters(cleaned)
+    effective_filters = _resolve_effective_active_filters(active_filters, inferred_filters)
     breakout_terms = ("breakout", "break down", "breakdown", "distribution", "split", "mix")
     has_breakout_intent = any(t in q for t in breakout_terms)
     has_compare_intent = _has_comparison_intent(q)
@@ -3929,12 +4042,12 @@ def build_direct_result_for_user_query(
         broad = _build_broad_differences_by_demographic(
             demo_id=str(broad_request["demo_id"]),
             top_n=10,
-            active_filters=active_filters,
+            active_filters=effective_filters,
         )
         if "error" not in broad:
             return broad
 
-    room_route = _resolve_room_intent_group(cleaned)
+    room_route = _resolve_room_intent_group(routed_question)
     if room_route:
         return _build_top_selected_for_question_group(
             question_group=str(room_route["question_group"]),
@@ -3946,7 +4059,7 @@ def build_direct_result_for_user_query(
             item_label=str(room_route.get("item_label", "Item")),
             summary_noun=str(room_route.get("summary_noun", "item")),
             item_keywords=room_route.get("item_keywords"),
-            active_filters=active_filters,
+            active_filters=effective_filters,
         )
 
     has_income = "income" in q
@@ -3985,9 +4098,9 @@ def build_direct_result_for_user_query(
 
     if _is_home_size_intent(cleaned):
         quick = _build_quick_insight(
-            question=cleaned,
+            question=routed_question,
             top_n=8,
-            active_filters=active_filters,
+            active_filters=effective_filters,
         )
         if "error" not in quick:
             return quick
@@ -4081,6 +4194,15 @@ def build_direct_result_for_user_query(
             )
             if "error" not in matrix:
                 return matrix
+
+    if inferred_filters:
+        segmented = _build_quick_insight(
+            question=routed_question,
+            top_n=8,
+            active_filters=effective_filters,
+        )
+        if "error" not in segmented:
+            return segmented
 
     return build_unanswerable_result_for_user_query(cleaned)
 

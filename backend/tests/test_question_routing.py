@@ -93,5 +93,73 @@ class QuestionRoutingTests(unittest.TestCase):
         self.assertIsNone(demo_id)
 
 
+class DirectSegmentFilterTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        if tools is None:
+            raise unittest.SkipTest(f"Missing backend deps for import: {_IMPORT_ERROR}")
+
+    def test_improvments_typo_routes_to_planned_improvements(self):
+        intent = tools._detect_room_matrix_intent(
+            "what are the top improvments planned for those living with children"
+        )
+        self.assertEqual(intent, "improvements_planned")
+
+    def test_extracts_children_segment_filter(self):
+        with patch.object(
+            tools,
+            "_resolve_target_demo_level_for_query",
+            return_value="TOTAL: Living With Children",
+        ):
+            base_question, inferred_filters = tools._extract_query_segment_active_filters(
+                "What are the top planned improvements for those living with children?"
+            )
+
+        self.assertEqual(base_question, "What are the top planned improvements")
+        self.assertEqual(
+            inferred_filters,
+            {"TOTAL: Children in Household": "TOTAL: Living With Children"},
+        )
+
+    def test_direct_route_applies_inferred_segment_filters(self):
+        inferred_filters = {
+            "TOTAL: Children in Household": "TOTAL: Living With Children",
+        }
+        room_payload = {
+            "question_group": "IKEA703",
+            "question_text": "Which planned improvements do you expect to make?",
+            "room_hint": "home",
+            "analysis_type": "top_planned_improvements",
+            "title_prefix": "Top Planned Improvements",
+            "item_label": "Planned improvement",
+            "summary_noun": "planned improvement",
+        }
+        built_payload = {
+            "analysis_type": "top_planned_improvements",
+            "insight_text": "ok",
+        }
+
+        with (
+            patch.object(
+                tools,
+                "_extract_query_segment_active_filters",
+                return_value=("What are the top planned improvements", inferred_filters),
+            ) as extract_mock,
+            patch.object(tools, "_resolve_room_intent_group", return_value=room_payload) as route_mock,
+            patch.object(tools, "_build_top_selected_for_question_group", return_value=built_payload) as top_mock,
+        ):
+            result = tools.build_direct_result_for_user_query(
+                "What are the top planned improvements for those living with children?"
+            )
+
+        self.assertEqual(result, built_payload)
+        extract_mock.assert_called_once()
+        route_mock.assert_called_once_with("What are the top planned improvements")
+        self.assertEqual(
+            top_mock.call_args.kwargs.get("active_filters"),
+            inferred_filters,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
