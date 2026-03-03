@@ -17,10 +17,12 @@ export function useVegaChart(spec: VegaLiteSpec | null) {
 
     const fullSpec = {
       ...specWithoutTitle,
-      ...(isFaceted ? {} : {
-        width: 'container' as const,
-        autosize: { type: 'fit-x' as const, contains: 'padding' as const },
-      }),
+      ...(isFaceted
+        ? {}
+        : {
+            width: 'container' as const,
+            autosize: { type: 'fit-x' as const, contains: 'padding' as const },
+          }),
     };
 
     let cancelled = false;
@@ -30,13 +32,15 @@ export function useVegaChart(spec: VegaLiteSpec | null) {
       renderer: 'svg',
       // Prevent unnecessary tooltip jitter
       tooltip: { theme: 'custom' },
-    }).then((result) => {
-      if (!cancelled) {
-        viewRef.current = result;
-      }
-    }).catch(() => {
-      // Spec may be invalid during streaming; ignore
-    });
+    })
+      .then((result) => {
+        if (!cancelled) {
+          viewRef.current = result;
+        }
+      })
+      .catch(() => {
+        // Spec may be invalid during streaming; ignore
+      });
 
     return () => {
       cancelled = true;
@@ -49,7 +53,19 @@ export function useVegaChart(spec: VegaLiteSpec | null) {
 
   const exportPNG = async (): Promise<string | null> => {
     if (!viewRef.current) return null;
-    return viewRef.current.view.toImageURL('png', 2); // 2x for retina
+
+    // Use adaptive high-resolution export so charts from the half-width panel
+    // don't look soft when opened full-screen.
+    const view = viewRef.current.view;
+    const width = Math.max(1, Number(view.width() || 0));
+    const height = Math.max(1, Number(view.height() || 0));
+    const longEdge = Math.max(width, height);
+
+    // Target ~2200px long edge while keeping memory usage reasonable.
+    const adaptiveScale = Math.ceil(2200 / longEdge);
+    const scale = Math.max(2, Math.min(6, adaptiveScale));
+
+    return view.toImageURL('png', scale);
   };
 
   const exportSVG = async (): Promise<string | null> => {

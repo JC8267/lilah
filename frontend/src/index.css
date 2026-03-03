@@ -37,10 +37,11 @@ body {
 
 /* ── Vega chart rendering ── */
 
-/* Ensure SVGs inside chart containers scale properly */
+/* Keep chart SVG at native size; allow horizontal scroll instead of squashing. */
 .chart-container svg {
-  max-width: 100%;
+  max-width: none !important;
   height: auto !important;
+  display: block;
 }
 
 /* Suppress the default Vega title since we render our own in ChartCard header.
