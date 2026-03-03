@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import logging
+import time
 from collections.abc import AsyncGenerator
 from typing import Any
 
@@ -9,6 +11,13 @@ from app.agent.provider import get_provider, resolve_runtime_options
 from app.agent.system_prompt import build_system_prompt
 from app.agent.tools import TOOL_DEFINITIONS, build_direct_result_for_user_query, handle_tool_call
 from app.config import settings
+
+logger = logging.getLogger("lilah.agent")
+
+
+def _log_struct(level: int, event: str, **fields: object) -> None:
+    payload = {"event": event, **fields}
+    logger.log(level, json.dumps(payload, default=str))
 
 
 def _compact_tool_result_for_model(tool_name: str, result_data: Any) -> str:
@@ -127,6 +136,8 @@ def _tool_call_signature(name: str, tool_input: dict[str, Any]) -> str:
 async def run_agent_loop(
     messages: list[dict],
     llm_override: dict[str, Any] | None = None,
+    request_id: str | None = None,
+    conversation_id: str | None = None,
 ) -> AsyncGenerator[dict, None]:
     """
     Run the agent loop. Yields SSE event dicts:
@@ -137,13 +148,33 @@ async def run_agent_loop(
       {event: "done", data: {}}
       {event: "error", data: {message: str}}
     """
+    def _error_data(message: str) -> dict[str, Any]:
+        payload: dict[str, Any] = {"message": message}
+        if request_id:
+            payload["request_id"] = request_id
+        return payload
+
     try:
         llm_options = resolve_runtime_options(llm_override)
     except Exception as e:
-        yield {"event": "error", "data": {"message": str(e)}}
+        _log_struct(
+            logging.ERROR,
+            "llm_options_error",
+            request_id=request_id,
+            conversation_id=conversation_id,
+            error=str(e),
+        )
+        yield {"event": "error", "data": _error_data(str(e))}
         return
 
     try:
+        _log_struct(
+            logging.INFO,
+            "agent_loop_start",
+            request_id=request_id,
+            conversation_id=conversation_id,
+            message_count=len(messages),
+        )
         provider = get_provider(llm_options)
         system_prompt = build_system_prompt()
         charts: list[dict] = []
@@ -231,7 +262,14 @@ async def run_agent_loop(
                 message = str(last_error) if last_error else "LLM call failed."
                 if len(model_candidates) > 1:
                     message += f" Tried models: {', '.join(model_candidates)}"
-                yield {"event": "error", "data": {"message": message}}
+                _log_struct(
+                    logging.ERROR,
+                    "model_turn_failed",
+                    request_id=request_id,
+                    conversation_id=conversation_id,
+                    error=message,
+                )
+                yield {"event": "error", "data": _error_data(message)}
                 return
 
             if turn.text:
@@ -243,6 +281,7 @@ async def run_agent_loop(
             tool_uses = []
             blocked_repeated_call = False
             for tc in turn.tool_calls:
+                tool_started_at = time.perf_counter()
                 yield {
                     "event": "tool_start",
                     "data": {"tool": tc.name, "input": tc.input},
@@ -261,6 +300,14 @@ async def run_agent_loop(
                         )
                     }
                     result_str = json.dumps(result_data)
+                    _log_struct(
+                        logging.WARNING,
+                        "tool_call_blocked_repeat",
+                        request_id=request_id,
+                        conversation_id=conversation_id,
+                        tool=tc.name,
+                        repeat_count=repeat_count,
+                    )
                 else:
                     try:
                         result_str = await asyncio.to_thread(
@@ -275,9 +322,30 @@ async def run_agent_loop(
                     except Exception as e:
                         result_data = {"error": f"Tool execution failed: {e}"}
                         result_str = json.dumps(result_data)
+                        duration_ms = round((time.perf_counter() - tool_started_at) * 1000.0, 2)
+                        _log_struct(
+                            logging.ERROR,
+                            "tool_call_exception",
+                            request_id=request_id,
+                            conversation_id=conversation_id,
+                            tool=tc.name,
+                            duration_ms=duration_ms,
+                            error=str(e),
+                        )
 
                 if not isinstance(result_data, dict):
                     result_data = {"raw": result_data}
+
+                duration_ms = round((time.perf_counter() - tool_started_at) * 1000.0, 2)
+                _log_struct(
+                    logging.INFO,
+                    "tool_call_complete",
+                    request_id=request_id,
+                    conversation_id=conversation_id,
+                    tool=tc.name,
+                    duration_ms=duration_ms,
+                    ok=("error" not in result_data),
+                )
 
                 insight = result_data.get("insight_text")
                 if isinstance(insight, str) and insight.strip():
@@ -416,6 +484,21 @@ async def run_agent_loop(
             # Ensure clients receive at least one text chunk when only fallback text exists.
             yield {"event": "text_delta", "data": {"content": full_text}}
 
+        _log_struct(
+            logging.INFO,
+            "agent_loop_done",
+            request_id=request_id,
+            conversation_id=conversation_id,
+            chart_count=len(charts),
+            text_len=len(full_text or ""),
+        )
         yield {"event": "done", "data": {"charts": charts, "text": full_text}}
     except Exception as e:
-        yield {"event": "error", "data": {"message": f"Agent loop crashed: {e}"}}
+        _log_struct(
+            logging.ERROR,
+            "agent_loop_crash",
+            request_id=request_id,
+            conversation_id=conversation_id,
+            error=str(e),
+        )
+        yield {"event": "error", "data": _error_data(f"Agent loop crashed: {e}")}

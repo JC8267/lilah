@@ -22,7 +22,13 @@ class Settings(BaseSettings):
     question_match_model_top_k: int = 8
     question_match_model_min_confidence: float = 0.55
     question_match_model_timeout_seconds: float = 12.0
+    allow_llm_override: bool = False
     chat_history_max_messages: int = 10
+    chat_request_max_bytes: int = 65536
+    chat_message_max_chars: int = 4000
+    chat_filters_max_items: int = 12
+    chat_filter_key_max_chars: int = 80
+    chat_filter_value_max_chars: int = 200
     data_dir: Path = BACKEND_ROOT.parent / "normalized"
     sqlite_path: Path = BACKEND_ROOT / "lilah.db"
     max_query_rows: int = 200
