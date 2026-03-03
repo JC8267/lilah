@@ -1144,15 +1144,21 @@ DEMO_KEYWORD_TO_ID: list[tuple[str, str]] = [
     ("children household", "TOTAL: Children in Household"),
     ("income", "TOTAL: Income"),
     ("age", "TOTAL: Age"),
+    ("age cohort", "TOTAL: Age"),
+    ("age cohorts", "TOTAL: Age"),
     ("gender", "TOTAL: Gender"),
     ("sex", "TOTAL: Gender"),
     ("ethnicity", "TOTAL: Ethnicity"),
+    ("etnicity", "TOTAL: Ethnicity"),
+    ("ethnic", "TOTAL: Ethnicity"),
     ("race", "TOTAL: Ethnicity"),
     ("region", "TOTAL: Region"),
     ("education", "TOTAL: Education"),
     ("home ownership", "TOTAL: Home Ownership"),
     ("homeowner", "TOTAL: Home Ownership"),
     ("homeowners", "TOTAL: Home Ownership"),
+    ("owner", "TOTAL: Home Ownership"),
+    ("owners", "TOTAL: Home Ownership"),
     ("renter", "TOTAL: Home Ownership"),
     ("renters", "TOTAL: Home Ownership"),
     ("housing type", "TOTAL: Housing Type"),
@@ -1230,6 +1236,90 @@ def _resolve_demo_id_from_text(text: str) -> str | None:
     if not rows:
         return None
     return str(rows[0][0])
+
+
+_BROAD_DIFF_SUPPORTED_DEMO_IDS = {
+    "TOTAL: Home Ownership",
+    "TOTAL: Age",
+    "TOTAL: Ethnicity",
+    "TOTAL: Income",
+    "TOTAL: Gender",
+    "TOTAL: Education",
+    "TOTAL: Region",
+    "TOTAL: Area Type",
+    "TOTAL: Housing Type",
+}
+
+_BROAD_DIFF_OPERATOR_TERMS = (
+    "differ most",
+    "differ the most",
+    "most different",
+    "biggest difference",
+    "biggest differences",
+    "largest difference",
+    "largest differences",
+    "vary the most",
+    "stand out the most",
+)
+
+_BROAD_DIFF_SCOPE_TERMS = (
+    "what sort of things",
+    "what kinds of things",
+    "what kind of things",
+    "what things",
+    "which things",
+    "which topics",
+    "what topics",
+    "in general",
+    "overall",
+    "across the survey",
+)
+
+
+def _normalize_broad_demo_id(demo_id: str | None) -> str | None:
+    if not demo_id:
+        return None
+
+    cleaned = str(demo_id).strip()
+    if cleaned == "TOTAL: Race":
+        return "TOTAL: Ethnicity"
+    if cleaned in _BROAD_DIFF_SUPPORTED_DEMO_IDS:
+        return cleaned
+
+    if ":" not in cleaned:
+        return None
+    suffix = cleaned.split(":", 1)[1].strip()
+    if not suffix:
+        return None
+    candidate = f"TOTAL: {suffix}"
+    if candidate == "TOTAL: Race":
+        candidate = "TOTAL: Ethnicity"
+    return candidate if candidate in _BROAD_DIFF_SUPPORTED_DEMO_IDS else None
+
+
+def _resolve_broad_demo_difference_request(text: str) -> dict[str, str] | None:
+    q = (text or "").lower().strip()
+    if not q:
+        return None
+
+    has_operator = any(t in q for t in _BROAD_DIFF_OPERATOR_TERMS)
+    if not has_operator:
+        return None
+
+    has_scope_hint = any(t in q for t in _BROAD_DIFF_SCOPE_TERMS)
+    has_what_form = bool(re.search(r"\bwhat\b.*\bdiffer\b.*\bmost\b", q))
+    if not (has_scope_hint or has_what_form):
+        return None
+
+    demo_id = _normalize_broad_demo_id(_resolve_demo_id_from_text(q))
+    if not demo_id:
+        return None
+
+    subject = _extract_extreme_subject_query(text)
+    if subject and len(_extract_answerability_anchor_tokens(subject)) >= 1:
+        return None
+
+    return {"demo_id": demo_id}
 
 
 def _is_extreme_difference_intent(text: str) -> bool:
@@ -1918,6 +2008,364 @@ def _build_extreme_difference_by_demographic(
     }
 
 
+def _build_broad_differences_by_demographic(
+    *,
+    demo_id: str,
+    top_n: int = 10,
+    active_filters: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Rank broad, topic-level differences across the dataset for one demographic split."""
+    top_n = max(5, min(int(top_n), 20))
+    did_sql = _escape_sql_literal(demo_id)
+
+    level_sql = f"""
+        SELECT DISTINCT demo_level
+        FROM survey_long
+        WHERE demo_id = '{did_sql}'
+          AND demo_level IS NOT NULL
+          AND TRIM(demo_level) <> ''
+        ORDER BY demo_level
+    """
+    level_result = execute_query(level_sql)
+    if "error" in level_result:
+        return {"error": level_result["error"], "demo_id": demo_id}
+
+    demo_levels = [str(r[0]).strip() for r in level_result.get("rows", []) if r and str(r[0]).strip()]
+    if len(demo_levels) < 2:
+        return {
+            "error": f"Broad difference scan requires at least two groups for {demo_id}.",
+            "demo_id": demo_id,
+        }
+
+    response_option_exclusions = [
+        "maximum",
+        "minimum",
+        "mean",
+        "median",
+        "stddev",
+        "standard deviation",
+        "first quartile",
+        "third quartile",
+        "interquartile range",
+        "iqr",
+        "mode",
+        "count",
+        "sum",
+    ]
+    exclusion_sql = ", ".join(f"'{_escape_sql_literal(v)}'" for v in response_option_exclusions)
+
+    home_ownership_response_exclusion_sql = ""
+    if demo_id == "TOTAL: Home Ownership":
+        home_ownership_response_exclusion_sql = (
+            "AND LOWER(TRIM(response_option)) NOT IN "
+            "('home owner', 'homeowner', 'renter', 'renters')"
+        )
+
+    sql = f"""
+        WITH base AS (
+            SELECT
+                question_id,
+                question_group,
+                MIN(question_text) AS question_text,
+                COALESCE(NULLIF(TRIM(question_level), ''), question_id) AS item_label,
+                response_option,
+                demo_level,
+                AVG(response_value_num) AS response_value,
+                AVG(weighted_margin_of_error_num) AS weighted_moe,
+                AVG(unweighted_margin_of_error_num) AS unweighted_moe
+            FROM survey_long
+            WHERE demo_id = '{did_sql}'
+              AND question_id NOT LIKE 'IKEAdem%'
+              AND response_value_num IS NOT NULL
+              AND response_value_num BETWEEN 0 AND 1
+              AND response_option IS NOT NULL
+              AND TRIM(response_option) <> ''
+              AND regexp_matches(response_option, '[A-Za-z]')
+              AND LOWER(TRIM(response_option)) NOT IN ({exclusion_sql})
+              AND NOT regexp_matches(TRIM(response_option), '^[0-9]+\\s*[-–]\\s*[0-9]+$')
+              AND NOT regexp_matches(TRIM(response_option), '^[0-9]+(\\.[0-9]+)?\\+?$')
+              {home_ownership_response_exclusion_sql}
+            GROUP BY
+                question_id,
+                question_group,
+                COALESCE(NULLIF(TRIM(question_level), ''), question_id),
+                response_option,
+                demo_level
+        ),
+        spread AS (
+            SELECT
+                question_id,
+                question_group,
+                question_text,
+                item_label,
+                response_option,
+                MAX(response_value) - MIN(response_value) AS gap_raw,
+                ARG_MAX(demo_level, response_value) AS high_group,
+                MAX(response_value) AS high_value,
+                ARG_MAX(100.0 * COALESCE(weighted_moe, unweighted_moe), response_value) AS high_moe,
+                ARG_MIN(demo_level, response_value) AS low_group,
+                MIN(response_value) AS low_value,
+                ARG_MIN(100.0 * COALESCE(weighted_moe, unweighted_moe), response_value) AS low_moe,
+                COUNT(*) AS group_count
+            FROM base
+            GROUP BY question_id, question_group, question_text, item_label, response_option
+            HAVING COUNT(*) >= 2
+        ),
+        ranked AS (
+            SELECT
+                *,
+                ROW_NUMBER() OVER (
+                    PARTITION BY question_id
+                    ORDER BY
+                        gap_raw DESC,
+                        CASE
+                            WHEN LOWER(TRIM(response_option)) IN ('selected', 'yes', 'true', 'own') THEN 0
+                            ELSE 1
+                        END ASC,
+                        response_option
+                ) AS rn
+            FROM spread
+        )
+        SELECT
+            question_id,
+            question_group,
+            question_text,
+            item_label,
+            response_option,
+            low_group,
+            100.0 * low_value AS low_percent,
+            high_group,
+            100.0 * high_value AS high_percent,
+            100.0 * gap_raw AS gap_points,
+            CASE
+                WHEN low_moe IS NOT NULL AND high_moe IS NOT NULL
+                    THEN SQRT(low_moe * low_moe + high_moe * high_moe)
+                ELSE NULL
+            END AS combined_moe_points
+        FROM ranked
+        WHERE rn = 1
+        ORDER BY gap_raw DESC, question_id
+        LIMIT {top_n * 4}
+    """
+
+    result = execute_query(sql)
+    if "error" in result:
+        return {"error": result["error"], "demo_id": demo_id}
+
+    rows = result.get("rows", [])
+    cols = result.get("columns", [])
+    if not rows:
+        return {
+            "error": f"No broad difference rows were returned for {demo_id}.",
+            "demo_id": demo_id,
+        }
+
+    i_qid = cols.index("question_id")
+    i_qg = cols.index("question_group") if "question_group" in cols else -1
+    i_qtext = cols.index("question_text")
+    i_item = cols.index("item_label")
+    i_opt = cols.index("response_option")
+    i_low_group = cols.index("low_group")
+    i_low_pct = cols.index("low_percent")
+    i_high_group = cols.index("high_group")
+    i_high_pct = cols.index("high_percent")
+    i_gap = cols.index("gap_points")
+    i_moe = cols.index("combined_moe_points") if "combined_moe_points" in cols else -1
+
+    findings: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            low_percent = float(row[i_low_pct])
+            high_percent = float(row[i_high_pct])
+            gap_points = float(row[i_gap])
+        except (TypeError, ValueError):
+            continue
+        if gap_points <= 0:
+            continue
+
+        combined_moe: float | None = None
+        if i_moe >= 0:
+            try:
+                raw_moe = row[i_moe]
+                combined_moe = float(raw_moe) if raw_moe is not None else None
+            except (TypeError, ValueError):
+                combined_moe = None
+
+        question_id = str(row[i_qid]).strip()
+        question_group = str(row[i_qg]).strip() if i_qg >= 0 and row[i_qg] is not None else ""
+        question_text = str(row[i_qtext]).strip()
+        item_label = str(row[i_item]).strip()
+        response_option = str(row[i_opt]).strip()
+        low_group = _short_demo_level(str(row[i_low_group]).strip())
+        high_group = _short_demo_level(str(row[i_high_group]).strip())
+
+        topic = item_label if item_label and item_label != question_id else question_text
+        if not topic:
+            topic = question_text or question_id
+
+        findings.append(
+            {
+                "question_id": question_id,
+                "question_group": question_group or None,
+                "question_text": question_text,
+                "topic": topic,
+                "response_option": response_option,
+                "low_group": low_group,
+                "low_percent": low_percent,
+                "high_group": high_group,
+                "high_percent": high_percent,
+                "gap_points": gap_points,
+                "combined_moe_points": combined_moe,
+                "is_significant": (
+                    combined_moe is not None and gap_points > combined_moe
+                ),
+            }
+        )
+
+    findings.sort(key=lambda x: x["gap_points"], reverse=True)
+    top_findings = findings[:top_n]
+    if not top_findings:
+        return {
+            "error": f"No usable broad-difference findings were available for {demo_id}.",
+            "demo_id": demo_id,
+        }
+
+    significant_count = sum(1 for f in top_findings if f["is_significant"])
+    missing_moe_count = sum(1 for f in top_findings if f["combined_moe_points"] is None)
+
+    lead = top_findings[0]
+    lead_sig_text = "significance unavailable"
+    if lead["combined_moe_points"] is not None:
+        if lead["is_significant"]:
+            lead_sig_text = "statistically significant at ~95%"
+        else:
+            lead_sig_text = "not statistically significant at ~95%"
+
+    demo_label = _short_demo_label(demo_id)
+    narrative_lines = [
+        f"**Largest differences by {demo_label} across survey topics**",
+        f"- Ranked by the largest between-group gap for each question (top **{len(top_findings)}** shown).",
+        f"- Biggest gap: **{lead['topic']}** ({lead['response_option']}) from **{lead['low_group']} ({lead['low_percent']:.2f}%)** to "
+        f"**{lead['high_group']} ({lead['high_percent']:.2f}%)** (**{lead['gap_points']:.2f} pts**, {lead_sig_text}).",
+        f"- Significant differences among shown rows (~95%): **{significant_count}/{len(top_findings)}**.",
+    ]
+    if missing_moe_count > 0:
+        narrative_lines.append(
+            f"- MOE missing for **{missing_moe_count}** row(s); significance is unavailable for those rows."
+        )
+
+    normalized_filters = _normalize_active_filters(active_filters)
+    if normalized_filters:
+        narrative_lines.append(
+            "- Note: active filters are ignored for this broad scan because the source tables do not provide multi-demographic intersections."
+        )
+
+    narrative_lines.append(
+        f"- Refine with: `Compare <topic> by {demo_label}` (for example: `Compare storage furniture by {demo_label}`)."
+    )
+
+    chart_values = [
+        {
+            "topic": _truncate_label(str(row["topic"]), 56),
+            "gap_points": round(float(row["gap_points"]), 2),
+            "significant": "Significant" if row["is_significant"] else "Not significant",
+            "response_option": _truncate_label(str(row["response_option"]), 28),
+            "low_group": str(row["low_group"]),
+            "low_percent": round(float(row["low_percent"]), 2),
+            "high_group": str(row["high_group"]),
+            "high_percent": round(float(row["high_percent"]), 2),
+            "combined_moe_points": (
+                round(float(row["combined_moe_points"]), 2)
+                if row["combined_moe_points"] is not None
+                else None
+            ),
+            "question_id": str(row["question_id"]),
+            "question_text": str(row["question_text"]),
+        }
+        for row in top_findings
+    ]
+
+    chart_spec: dict[str, Any] = {
+        "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+        "title": {
+            "text": f"Largest {demo_label} Differences Across Survey Topics",
+            "subtitle": f"Top {len(chart_values)} question-level signals",
+            "anchor": "start",
+        },
+        "data": {"values": chart_values},
+        "mark": {"type": "bar", "cornerRadiusEnd": 4},
+        "encoding": {
+            "y": {
+                "field": "topic",
+                "type": "nominal",
+                "sort": "-x",
+                "title": None,
+                "axis": {"labelLimit": 320},
+            },
+            "x": {
+                "field": "gap_points",
+                "type": "quantitative",
+                "title": "Gap across groups (percentage points)",
+                "axis": {"format": ".1f", "grid": True},
+            },
+            "color": {
+                "field": "significant",
+                "type": "nominal",
+                "scale": {
+                    "domain": ["Significant", "Not significant"],
+                    "range": [_BRAND_BLUE, "#9ca3af"],
+                },
+                "legend": {"orient": "top-right"},
+            },
+            "tooltip": [
+                {"field": "topic", "type": "nominal", "title": "Topic"},
+                {"field": "response_option", "type": "nominal", "title": "Response option"},
+                {"field": "low_group", "type": "nominal", "title": "Low group"},
+                {"field": "low_percent", "type": "quantitative", "title": "Low %", "format": ".2f"},
+                {"field": "high_group", "type": "nominal", "title": "High group"},
+                {"field": "high_percent", "type": "quantitative", "title": "High %", "format": ".2f"},
+                {"field": "gap_points", "type": "quantitative", "title": "Gap (pts)", "format": ".2f"},
+                {"field": "combined_moe_points", "type": "quantitative", "title": "Combined MOE (pts)", "format": ".2f"},
+                {"field": "significant", "type": "nominal", "title": "Significance"},
+                {"field": "question_id", "type": "nominal", "title": "Question ID"},
+            ],
+        },
+        "config": _CHART_CONFIG,
+    }
+
+    return {
+        "analysis_type": "broad_demo_differences",
+        "demo_id": demo_id,
+        "demo_level_count": len(demo_levels),
+        "row_count": len(top_findings),
+        "significant_count": significant_count,
+        "top_findings": [
+            {
+                "question_id": row["question_id"],
+                "question_group": row["question_group"],
+                "question_text": row["question_text"],
+                "topic": row["topic"],
+                "response_option": row["response_option"],
+                "low_group": row["low_group"],
+                "low_percent": round(float(row["low_percent"]), 2),
+                "high_group": row["high_group"],
+                "high_percent": round(float(row["high_percent"]), 2),
+                "gap_points": round(float(row["gap_points"]), 2),
+                "combined_moe_points": (
+                    round(float(row["combined_moe_points"]), 2)
+                    if row["combined_moe_points"] is not None
+                    else None
+                ),
+                "is_significant": bool(row["is_significant"]),
+            }
+            for row in top_findings
+        ],
+        "sql": sql.strip(),
+        "insight_text": "\n".join(narrative_lines),
+        "chart": chart_spec,
+    }
+
+
 _ANSWERABILITY_GENERIC_TOKENS = {
     "home",
     "house",
@@ -2119,6 +2567,8 @@ def build_unanswerable_result_for_user_query(
     # Preserve known deterministic paths; this guard is only for uncertain retrieval.
     if _resolve_room_intent_group(cleaned):
         return None
+    if _resolve_broad_demo_difference_request(cleaned):
+        return None
     if _is_age_homeownership_intent(cleaned):
         return None
     if _is_age_demographic_intent(cleaned):
@@ -2261,6 +2711,16 @@ def _build_quick_insight(
         )
         if "error" not in extreme:
             return extreme
+
+    broad_request = _resolve_broad_demo_difference_request(question)
+    if broad_request:
+        broad = _build_broad_differences_by_demographic(
+            demo_id=str(broad_request["demo_id"]),
+            top_n=min(top_n, 12),
+            active_filters=active_filters,
+        )
+        if "error" not in broad:
+            return broad
 
     room_route = _resolve_room_intent_group(question)
     if room_route:
@@ -3415,6 +3875,16 @@ def build_direct_result_for_user_query(
         )
         if "error" not in extreme:
             return extreme
+
+    broad_request = _resolve_broad_demo_difference_request(cleaned)
+    if broad_request:
+        broad = _build_broad_differences_by_demographic(
+            demo_id=str(broad_request["demo_id"]),
+            top_n=10,
+            active_filters=active_filters,
+        )
+        if "error" not in broad:
+            return broad
 
     room_route = _resolve_room_intent_group(cleaned)
     if room_route:
