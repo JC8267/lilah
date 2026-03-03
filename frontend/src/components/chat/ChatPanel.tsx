@@ -38,7 +38,6 @@ export function ChatPanel({ className = '' }: ChatPanelProps) {
                 'What types of homes do people live in?',
                 'How does furniture ownership differ by income?',
                 'What are the top planned purchases for kitchens?',
-                'Compare renters vs homeowners on room satisfaction',
               ].map((q) => (
                 <button
                   key={q}
