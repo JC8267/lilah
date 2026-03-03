@@ -1154,6 +1154,10 @@ DEMO_KEYWORD_TO_ID: list[tuple[str, str]] = [
     ("ethnicity", "TOTAL: Ethnicity"),
     ("etnicity", "TOTAL: Ethnicity"),
     ("ethnic", "TOTAL: Ethnicity"),
+    ("hispanic", "TOTAL: Ethnicity"),
+    ("hispanics", "TOTAL: Ethnicity"),
+    ("latino", "TOTAL: Ethnicity"),
+    ("latina", "TOTAL: Ethnicity"),
     ("race", "TOTAL: Ethnicity"),
     ("region", "TOTAL: Region"),
     ("education", "TOTAL: Education"),
@@ -1347,6 +1351,10 @@ def _is_extreme_difference_intent(text: str) -> bool:
             "under-index",
         )
     )
+    has_operator = has_operator or bool(
+        re.search(r"\bdiffer\w*\b.*\b(most|least)\b|\b(most|least)\b.*\bdiffer\w*\b", q)
+    )
+
     has_comparison = any(
         t in q
         for t in (
@@ -1358,9 +1366,11 @@ def _is_extreme_difference_intent(text: str) -> bool:
             "compared",
             "against",
             "than national",
+            "from national",
             "national average",
             "national averages",
             "than total",
+            "from total",
             "total respondents",
         )
     )
@@ -1375,6 +1385,8 @@ def _detect_extreme_operator(text: str) -> str:
         return "higher"
     if any(t in q for t in ("closest", "most similar", "least different", "smallest difference")):
         return "closest"
+    if bool(re.search(r"\bdiffer\w*\b.*\bleast\b|\bleast\b.*\bdiffer\w*\b", q)):
+        return "closest"
     return "most_different"
 
 
@@ -1388,8 +1400,8 @@ def _extract_extreme_subject_query(text: str) -> str | None:
         r"in terms of\s+(.+)$",
         r"regarding\s+(.+)$",
         r"about\s+(.+)$",
-        r"for\s+(.+)$",
         r"on\s+(.+)$",
+        r"for\s+(.+)$",
     ]
     for pattern in patterns:
         match = re.search(pattern, raw, flags=re.IGNORECASE)
@@ -1444,6 +1456,15 @@ def _resolve_target_demo_level_for_query(demo_id: str, query: str) -> str | None
             preferred_tokens = ["single", "home"]
         elif any(t in q for t in ("multifamily", "multi-family", "duplex", "condo", "townhome", "townhouse")):
             preferred_tokens = ["multifamily", "duplex", "condo", "townhome", "townhouse", "multi"]
+    elif demo_id == "TOTAL: Ethnicity":
+        if any(t in q for t in ("hispanic", "hispanics", "latino", "latina", "latinx")):
+            preferred_tokens = ["hispanic"]
+        elif "black" in q:
+            preferred_tokens = ["black"]
+        elif "white" in q:
+            preferred_tokens = ["white"]
+        elif "asian" in q:
+            preferred_tokens = ["asian"]
     elif demo_id == "TOTAL: Area Type":
         if "urban" in q:
             preferred_tokens = ["urban"]
@@ -1475,6 +1496,11 @@ def _resolve_target_demo_level_for_query(demo_id: str, query: str) -> str | None
         overlap = len(level_tokens.intersection(q_tokens))
         score += float(overlap) * 1.5
 
+        if demo_id == "TOTAL: Ethnicity" and any(t in q for t in ("hispanic", "hispanics", "latino", "latina", "latinx")):
+            if "hispanic" in level_tokens and "non" not in level_tokens:
+                score += 6.0
+            elif "hispanic" in level_tokens and "non" in level_tokens:
+                score -= 3.0
         for token in preferred_tokens:
             if token and token in level_tokens:
                 score += 4.0
@@ -1550,6 +1576,25 @@ def _build_extreme_difference_by_demographic(
         question_text = str(best.get("question_text", "")).strip()
         if not question_id:
             return {"error": "Matched question is missing question_id."}
+
+        # Matrix-style questions often come back as *_1 item IDs; promote to full group-level
+        # comparison so we rank meaningful items instead of Selected/Not Selected only.
+        candidate_group = str(best.get("question_group", "")).strip()
+        has_question_level = str(best.get("has_question_level", "")).strip().lower() in {"1", "true", "t", "yes"}
+        if candidate_group and "_" in question_id and has_question_level:
+            cg_sql = _escape_sql_literal(candidate_group)
+            count_sql = f"""
+                SELECT COUNT(DISTINCT question_id) AS n_items
+                FROM question_catalog
+                WHERE question_group = '{cg_sql}'
+            """
+            count_result = execute_query(count_sql)
+            if "error" not in count_result:
+                count_rows = count_result.get("rows", [])
+                if count_rows and count_rows[0] and int(count_rows[0][0] or 0) > 1:
+                    question_group = candidate_group
+                    question_id = None
+                    question_text = _resolve_group_question_text(candidate_group)
 
     qid_sql = _escape_sql_literal(question_id) if question_id else ""
     qg_sql = _escape_sql_literal(question_group) if question_group else ""
