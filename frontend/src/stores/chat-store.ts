@@ -9,8 +9,10 @@ interface ChatState {
   streamingCharts: VegaLiteSpec[];
   isStreaming: boolean;
   toolStatus: { tool: string; status: 'running' | 'done' } | null;
+  conversationsLoading: boolean;
 
   setConversations: (convs: Conversation[]) => void;
+  setConversationsLoading: (loading: boolean) => void;
   setActiveConversation: (id: string | null) => void;
   addConversation: (conv: Conversation) => void;
   updateConversationTitle: (id: string, title: string) => void;
@@ -32,8 +34,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
   streamingCharts: [],
   isStreaming: false,
   toolStatus: null,
+  conversationsLoading: false,
 
   setConversations: (convs) => set({ conversations: convs }),
+  setConversationsLoading: (loading) => set({ conversationsLoading: loading }),
 
   setActiveConversation: (id) => set({ activeConversationId: id }),
 

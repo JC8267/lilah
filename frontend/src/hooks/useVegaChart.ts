@@ -12,8 +12,11 @@ export function useVegaChart(spec: VegaLiteSpec | null) {
     // Don't force width: 'container' on faceted/concat specs — it breaks layout.
     const isFaceted = 'facet' in spec || 'concat' in spec || 'hconcat' in spec || 'vconcat' in spec;
 
+    // Strip title from spec — ChartCard renders its own header
+    const { title: _title, ...specWithoutTitle } = spec;
+
     const fullSpec = {
-      ...spec,
+      ...specWithoutTitle,
       ...(isFaceted ? {} : {
         width: 'container' as const,
         autosize: { type: 'fit' as const, contains: 'padding' as const },

@@ -4,11 +4,24 @@
   --color-primary: #0058a3;
   --color-primary-light: #e0f0ff;
   --color-surface: #ffffff;
-  --color-surface-alt: #f8f9fa;
+  --color-surface-alt: #f1f3f5;
   --color-border: #e5e7eb;
   --color-text: #1a1a2e;
   --color-text-secondary: #6b7280;
   --color-accent: #ffdb00;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-primary: #4da6ff;
+    --color-primary-light: #1a2d42;
+    --color-surface: #1a1a2e;
+    --color-surface-alt: #242438;
+    --color-border: #2e2e45;
+    --color-text: #e4e4ec;
+    --color-text-secondary: #9ca3af;
+    --color-accent: #ffdb00;
+  }
 }
 
 body {
@@ -69,4 +82,9 @@ body {
 .vg-tooltip .value {
   color: #f9fafb !important;
   font-weight: 600 !important;
+}
+
+/* Hide duplicate Vega title (ChartCard renders its own header) */
+.chart-container .role-title-text {
+  display: none;
 }

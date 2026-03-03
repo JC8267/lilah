@@ -20,13 +20,13 @@ export function MessageBubble({ message }: MessageBubbleProps) {
         className={`max-w-[80%] rounded-2xl px-4 py-3 text-sm leading-relaxed ${
           isUser
             ? 'bg-[var(--color-primary)] text-white'
-            : 'bg-[var(--color-surface-alt)] text-[var(--color-text)]'
+            : 'bg-[var(--color-surface-alt)] text-[var(--color-text)] border-l-2 border-[var(--color-primary)]/20'
         }`}
       >
         {isUser ? (
           <p className="whitespace-pre-wrap">{message.content}</p>
         ) : (
-          <div className="prose prose-sm max-w-none [&_p]:my-1 [&_ul]:my-1 [&_li]:my-0.5">
+          <div className="prose prose-sm max-w-none [&_p]:my-1 [&_ul]:my-1 [&_li]:my-0.5 [&_strong]:font-semibold [&_a]:text-[var(--color-primary)]">
             <ReactMarkdown>{message.content}</ReactMarkdown>
           </div>
         )}

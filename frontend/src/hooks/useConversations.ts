@@ -5,12 +5,14 @@ import type { Message } from '../types';
 export function useConversations() {
   const {
     setConversations,
+    setConversationsLoading,
     setActiveConversation,
     setMessages,
     removeConversation,
   } = useChatStore();
 
   const loadConversations = useCallback(async () => {
+    setConversationsLoading(true);
     try {
       const res = await fetch('/api/conversations');
       if (res.ok) {
@@ -19,8 +21,10 @@ export function useConversations() {
       }
     } catch {
       // ignore
+    } finally {
+      setConversationsLoading(false);
     }
-  }, [setConversations]);
+  }, [setConversations, setConversationsLoading]);
 
   const selectConversation = useCallback(
     async (id: string) => {

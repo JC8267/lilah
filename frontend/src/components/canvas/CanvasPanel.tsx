@@ -1,4 +1,5 @@
 import { useRef, useEffect } from 'react';
+import { Loader2 } from 'lucide-react';
 import { useChatStore } from '../../stores/chat-store';
 import { ChartCard } from './ChartCard';
 import { InsightCard } from './InsightCard';
@@ -47,9 +48,15 @@ export function CanvasPanel({ className = '' }: CanvasPanelProps) {
             {group.charts.map((chart, ci) => (
               <ChartCard key={`${group.key}-chart-${ci}`} spec={chart} index={gi * 10 + ci} />
             ))}
-            {group.insight && <InsightCard text={group.insight} />}
+            {group.charts.length > 0 && group.insight && <InsightCard text={group.insight} />}
           </div>
         ))}
+        {isStreaming && streamingCharts.length === 0 && (
+          <div className="flex flex-col items-center justify-center py-16 text-[var(--color-text-secondary)]">
+            <Loader2 className="w-8 h-8 animate-spin text-[var(--color-primary)] mb-3" />
+            <span className="text-sm">Preparing visualizations…</span>
+          </div>
+        )}
         <div ref={bottomRef} />
       </div>
     </div>

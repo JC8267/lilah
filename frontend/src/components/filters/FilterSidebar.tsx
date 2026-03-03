@@ -56,7 +56,7 @@ export function FilterSidebar() {
           {activeFilters.map((f) => (
             <span
               key={f.demo_id}
-              className="inline-flex items-center gap-1 text-xs bg-[var(--color-primary-light)] text-[var(--color-primary)] px-2 py-0.5 rounded-full"
+              className="inline-flex items-center gap-1 text-xs bg-[var(--color-primary-light)] text-[var(--color-primary)] px-2 py-1 rounded-full"
             >
               {f.demo_level.replace(/^(TOTAL|CUSTOMER|PROSPECT): /, '')}
               <button onClick={() => removeFilter(f.demo_id)}>
@@ -68,7 +68,10 @@ export function FilterSidebar() {
       )}
 
       {/* Filter dropdowns */}
-      <div className="space-y-1.5 max-h-48 overflow-y-auto">
+      <div className="text-[10px] font-semibold tracking-wider uppercase text-[var(--color-text-secondary)] mt-2 mb-1">
+        Demographics
+      </div>
+      <div className="space-y-1.5 max-h-64 overflow-y-auto">
         {Array.from(groups.entries())
           .sort(([a], [b]) => a.localeCompare(b))
           .map(([groupId, values]) => {

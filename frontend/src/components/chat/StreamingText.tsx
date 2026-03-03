@@ -2,6 +2,17 @@ import ReactMarkdown from 'react-markdown';
 import { Bot, Loader2 } from 'lucide-react';
 import { useChatStore } from '../../stores/chat-store';
 
+const TOOL_LABELS: Record<string, string> = {
+  quick_insight: 'Analyzing survey data',
+  run_query: 'Querying the database',
+  create_chart: 'Building visualization',
+  summarize: 'Summarizing results',
+};
+
+function friendlyToolLabel(tool: string): string {
+  return TOOL_LABELS[tool] || tool.replace(/_/g, ' ');
+}
+
 export function StreamingText() {
   const streamingText = useChatStore((s) => s.streamingText);
   const toolStatus = useChatStore((s) => s.toolStatus);
@@ -19,15 +30,15 @@ export function StreamingText() {
             />
             <span>
               {toolStatus.status === 'running'
-                ? `Running ${toolStatus.tool}...`
-                : `${toolStatus.tool} complete`}
+                ? `${friendlyToolLabel(toolStatus.tool)}…`
+                : `${friendlyToolLabel(toolStatus.tool)} complete`}
             </span>
           </div>
         )}
         {streamingText ? (
           <div className="prose prose-sm max-w-none [&_p]:my-1 [&_ul]:my-1 [&_li]:my-0.5">
             <ReactMarkdown>{streamingText}</ReactMarkdown>
-            <span className="inline-block w-2 h-4 bg-[var(--color-primary)] animate-pulse ml-0.5" />
+            <span className="inline-block w-0.5 h-4 rounded-full bg-[var(--color-primary)] animate-pulse ml-0.5" />
           </div>
         ) : (
           !toolStatus && (

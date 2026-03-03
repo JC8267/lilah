@@ -25,24 +25,27 @@ export function ChatPanel({ className = '' }: ChatPanelProps) {
       <div className="flex-1 overflow-y-auto p-4 space-y-4">
         {messages.length === 0 && !isStreaming && (
           <div className="flex flex-col items-center justify-center h-full text-center">
-            <BarChart3 className="w-12 h-12 text-[var(--color-primary)] mb-4 opacity-40" />
+            <div className="w-16 h-16 rounded-full bg-[var(--color-primary-light)] flex items-center justify-center mb-4">
+              <BarChart3 className="w-8 h-8 text-[var(--color-primary)]" />
+            </div>
             <h2 className="text-xl font-semibold text-[var(--color-text)] mb-2">
-              Ask about the survey
+              What would you like to explore?
             </h2>
             <p className="text-sm text-[var(--color-text-secondary)] max-w-md">
-              Explore IKEA home furnishing survey data from 24K respondents. Ask questions
-              about home types, furniture ownership, purchase plans, demographics, and more.
+              I can help you analyze IKEA home furnishing survey data from 24K respondents —
+              just ask a question or pick a suggestion below.
             </p>
-            <div className="mt-6 grid grid-cols-1 sm:grid-cols-2 gap-2 max-w-lg">
+            <div className="mt-6 flex flex-col gap-2 max-w-md w-full">
               {[
                 'What types of homes do people live in?',
                 'How does furniture ownership differ by income?',
                 'What are the top planned purchases for kitchens?',
+                'Show me demographic breakdowns by region',
               ].map((q) => (
                 <button
                   key={q}
                   onClick={() => sendMessage(q)}
-                  className="text-left text-xs px-3 py-2 rounded-lg border border-[var(--color-border)] hover:bg-[var(--color-surface-alt)] transition-colors text-[var(--color-text-secondary)]"
+                  className="text-left text-sm px-3 py-2 rounded-lg border border-[var(--color-border)] hover:bg-[var(--color-surface-alt)] transition-colors text-[var(--color-text-secondary)]"
                 >
                   {q}
                 </button>

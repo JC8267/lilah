@@ -18,8 +18,8 @@ export function AppShell() {
       <Header />
       <div className="flex flex-1 overflow-hidden">
         <Sidebar />
-        <main className={`flex-1 flex ${hasCharts ? '' : ''}`}>
-          <ChatPanel className={hasCharts ? 'w-1/2 border-r border-[var(--color-border)]' : 'w-full'} />
+        <main className="flex-1 flex">
+          <ChatPanel className={`transition-all duration-300 ease-in-out ${hasCharts ? 'w-1/2 border-r border-[var(--color-border)]' : 'w-full'}`} />
           {hasCharts && <CanvasPanel className="w-1/2" />}
         </main>
       </div>
