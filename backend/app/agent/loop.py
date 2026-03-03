@@ -7,7 +7,11 @@ import time
 from collections.abc import AsyncGenerator
 from typing import Any
 
-from app.agent.provider import get_provider, resolve_runtime_options
+from app.agent.provider import (
+    get_provider,
+    resolve_reasoning_effort_for_attempt,
+    resolve_runtime_options,
+)
 from app.agent.system_prompt import build_system_prompt
 from app.agent.tools import TOOL_DEFINITIONS, build_direct_result_for_user_query, handle_tool_call
 from app.config import settings
@@ -263,10 +267,22 @@ async def run_agent_loop(
                             model_id=model_id,
                         )
                         return
+                    attempt_reasoning_effort = resolve_reasoning_effort_for_attempt(
+                        llm_options.reasoning_effort,
+                        attempt,
+                        llm_options.reasoning_escalate_on_retry,
+                    )
                     yield {
                         "event": "status",
                         "data": {
-                            "message": f"Model step: {model_id} (attempt {attempt + 1})"
+                            "message": (
+                                f"Model step: {model_id} (attempt {attempt + 1})"
+                                + (
+                                    f" [reasoning={attempt_reasoning_effort}]"
+                                    if attempt_reasoning_effort
+                                    else ""
+                                )
+                            )
                         },
                     }
                     try:
@@ -278,6 +294,7 @@ async def run_agent_loop(
                             model_id=model_id,
                             max_tokens=llm_options.max_tokens,
                             timeout_seconds=llm_options.timeout_seconds,
+                            reasoning_effort=attempt_reasoning_effort,
                         )
                         if _is_cancelled():
                             _log_struct(

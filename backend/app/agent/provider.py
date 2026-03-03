@@ -21,6 +21,39 @@ SUPPORTED_PROVIDERS = {
     "openai_compatible",
 }
 
+_ALLOWED_REASONING_EFFORTS = ("minimal", "low", "medium", "high")
+
+
+def _normalize_reasoning_effort(value: Any, *, field_name: str) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if not normalized:
+        return None
+    if normalized not in _ALLOWED_REASONING_EFFORTS:
+        allowed = ", ".join(_ALLOWED_REASONING_EFFORTS)
+        raise ValueError(f"{field_name} must be one of: {allowed}.")
+    return normalized
+
+
+def resolve_reasoning_effort_for_attempt(
+    reasoning_effort: str | None,
+    attempt: int,
+    escalate_on_retry: bool,
+) -> str | None:
+    if not reasoning_effort:
+        return None
+    if not escalate_on_retry or attempt <= 0:
+        return reasoning_effort
+
+    try:
+        idx = _ALLOWED_REASONING_EFFORTS.index(reasoning_effort)
+    except ValueError:
+        return reasoning_effort
+
+    escalated_idx = min(idx + attempt, len(_ALLOWED_REASONING_EFFORTS) - 1)
+    return _ALLOWED_REASONING_EFFORTS[escalated_idx]
+
 
 @dataclass(frozen=True)
 class ToolCall:
@@ -45,6 +78,8 @@ class LLMRuntimeOptions:
     timeout_seconds: float
     retry_attempts: int
     retry_backoff_seconds: float
+    reasoning_effort: str | None
+    reasoning_escalate_on_retry: bool
     fallback_model_ids: list[str]
     base_url: str
     api_key: str
@@ -64,6 +99,7 @@ class BaseProvider:
         model_id: str,
         max_tokens: int,
         timeout_seconds: float,
+        reasoning_effort: str | None = None,
     ) -> ModelTurn:
         raise NotImplementedError
 
@@ -89,8 +125,10 @@ class AnthropicProvider(BaseProvider):
         model_id: str,
         max_tokens: int,
         timeout_seconds: float,
+        reasoning_effort: str | None = None,
     ) -> ModelTurn:
         _ = timeout_seconds  # Anthropic SDK handles its own timeout configuration.
+        _ = reasoning_effort
 
         payload: dict[str, Any] = {
             "model": model_id,
@@ -183,6 +221,7 @@ class OpenAICompatibleProvider(BaseProvider):
         model_id: str,
         max_tokens: int,
         timeout_seconds: float,
+        reasoning_effort: str | None = None,
     ) -> ModelTurn:
         payload = {
             "model": model_id,
@@ -192,6 +231,8 @@ class OpenAICompatibleProvider(BaseProvider):
                 *self._to_openai_messages(history),
             ],
         }
+        if reasoning_effort and self._supports_reasoning_effort():
+            payload["reasoning_effort"] = reasoning_effort
         if tools:
             payload["tools"] = self._to_openai_tools(tools)
             payload["tool_choice"] = "auto"
@@ -261,6 +302,11 @@ class OpenAICompatibleProvider(BaseProvider):
             tool_calls=tool_calls,
             stop_reason=finish_reason,
         )
+
+    def _supports_reasoning_effort(self) -> bool:
+        if self._provider_name == "gemini":
+            return True
+        return "generativelanguage.googleapis.com" in self._base_url
 
     @staticmethod
     def _to_openai_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -385,6 +431,14 @@ def resolve_runtime_options(llm_override: dict[str, Any] | None) -> LLMRuntimeOp
     if retry_backoff_seconds <= 0:
         raise ValueError("llm_retry_backoff_seconds must be > 0.")
 
+    reasoning_effort = _normalize_reasoning_effort(
+        override.get("reasoning_effort", settings.llm_reasoning_effort),
+        field_name="reasoning_effort",
+    )
+    reasoning_escalate_on_retry = bool(settings.llm_reasoning_escalate_on_retry)
+    if override.get("reasoning_escalate_on_retry") is not None:
+        reasoning_escalate_on_retry = bool(override["reasoning_escalate_on_retry"])
+
     fallback_models_raw = settings.llm_fallback_models.strip()
     fallback_model_ids = [
         x.strip() for x in fallback_models_raw.split(",") if x.strip()
@@ -403,6 +457,8 @@ def resolve_runtime_options(llm_override: dict[str, Any] | None) -> LLMRuntimeOp
         timeout_seconds=timeout_seconds,
         retry_attempts=retry_attempts,
         retry_backoff_seconds=retry_backoff_seconds,
+        reasoning_effort=reasoning_effort,
+        reasoning_escalate_on_retry=reasoning_escalate_on_retry,
         fallback_model_ids=fallback_model_ids,
         base_url=_resolve_base_url(provider),
         api_key=_resolve_api_key(provider),

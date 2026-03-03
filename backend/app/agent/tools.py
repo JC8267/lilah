@@ -253,6 +253,7 @@ def _model_assisted_question_decision(
             model_id=llm_options.model_id,
             max_tokens=min(512, llm_options.max_tokens),
             timeout_seconds=timeout_seconds,
+            reasoning_effort=llm_options.reasoning_effort,
         )
     except Exception:
         return None

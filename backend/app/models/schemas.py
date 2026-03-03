@@ -22,6 +22,14 @@ class LLMOverride(BaseModel):
     retry_attempts: int | None = Field(
         default=None, ge=0, le=5, description="Optional retries for transient errors."
     )
+    reasoning_effort: str | None = Field(
+        default=None,
+        description="Optional reasoning effort override (minimal|low|medium|high).",
+    )
+    reasoning_escalate_on_retry: bool | None = Field(
+        default=None,
+        description="Optional toggle to increase reasoning effort on retries.",
+    )
     fallback_model_ids: list[str] | None = Field(
         default=None,
         description="Optional ordered fallback model IDs if primary model fails.",

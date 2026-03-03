@@ -17,6 +17,8 @@ class Settings(BaseSettings):
     llm_timeout_seconds: float = 60.0
     llm_retry_attempts: int = 2
     llm_retry_backoff_seconds: float = 1.0
+    llm_reasoning_effort: str = "minimal"  # "", minimal, low, medium, high
+    llm_reasoning_escalate_on_retry: bool = True
     llm_fallback_models: str = ""  # comma-separated model IDs
     question_match_model_assist: bool = True
     question_match_model_top_k: int = 8
