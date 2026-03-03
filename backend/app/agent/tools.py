@@ -1150,6 +1150,39 @@ def _has_comparison_intent(text: str) -> bool:
     )
 
 
+def _resolve_segment_first_comparison_request(text: str) -> dict[str, str] | None:
+    """Parse phrasing like: 'compare <segment> vs <other> for <topic>'."""
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return None
+
+    q = cleaned.lower()
+    if not _has_comparison_intent(q):
+        return None
+    if " vs " not in q and " versus " not in q:
+        return None
+
+    for_idx = q.rfind(" for ")
+    if for_idx == -1:
+        return None
+
+    segment_expr = cleaned[:for_idx].strip(" ?.")
+    segment_expr = re.sub(r"^(compare|comparing)\s+", "", segment_expr, flags=re.IGNORECASE).strip()
+    subject_question = cleaned[for_idx + 5 :].strip(" ?.")
+    if not segment_expr or len(subject_question) < 3:
+        return None
+
+    demo_id = _resolve_demo_id_from_text(segment_expr)
+    if not demo_id:
+        return None
+
+    return {
+        "segment_expr": segment_expr,
+        "subject_question": subject_question,
+        "demo_id": demo_id,
+    }
+
+
 DEMO_KEYWORD_TO_ID: list[tuple[str, str]] = [
     ("children in household", "TOTAL: Children in Household"),
     ("kids in household", "TOTAL: Children in Household"),
@@ -1161,6 +1194,7 @@ DEMO_KEYWORD_TO_ID: list[tuple[str, str]] = [
     ("no children", "TOTAL: Children in Household"),
     ("income", "TOTAL: Income"),
     ("age", "TOTAL: Age"),
+    ("ages", "TOTAL: Age"),
     ("age cohort", "TOTAL: Age"),
     ("age cohorts", "TOTAL: Age"),
     ("gender", "TOTAL: Gender"),
@@ -1536,12 +1570,12 @@ def _resolve_extreme_difference_request(text: str) -> dict[str, str] | None:
     if not demo_id:
         return None
 
-    target_demo_level = _resolve_target_demo_level_for_query(demo_id, text)
-    if not target_demo_level:
-        return None
-
     subject = _extract_extreme_subject_query(text)
     if not subject:
+        return None
+
+    target_demo_level = _resolve_target_demo_level_for_query(demo_id, text)
+    if not target_demo_level:
         return None
 
     operator = _detect_extreme_operator(text)
@@ -2658,6 +2692,8 @@ def build_unanswerable_result_for_user_query(
             segment_expr = cleaned[for_idx + 5 :].strip(" ?.")
             if _resolve_demo_id_from_text(segment_expr):
                 return None
+        if _resolve_segment_first_comparison_request(cleaned):
+            return None
 
     by_idx = q.rfind(" by ")
     if by_idx != -1:
@@ -2783,6 +2819,36 @@ def _build_quick_insight(
         )
         if "error" not in broad:
             return broad
+
+    segment_first = _resolve_segment_first_comparison_request(question)
+    if segment_first:
+        demo_id = str(segment_first["demo_id"])
+        subject_question = str(segment_first["subject_question"])
+        subject_room_route = _resolve_room_intent_group(subject_question)
+        if subject_room_route:
+            matrix = _build_question_group_by_demographic(
+                question=str(subject_room_route["question_text"]),
+                demo_id=demo_id,
+                top_n_items=24,
+                item_keywords=subject_room_route.get("item_keywords"),
+            )
+            if "error" not in matrix:
+                return matrix
+            cross = _build_question_by_demographic(
+                question=str(subject_room_route["question_text"]),
+                demo_id=demo_id,
+                top_n_options=5,
+            )
+            if "error" not in cross:
+                return cross
+
+        cross = _build_question_by_demographic(
+            question=subject_question,
+            demo_id=demo_id,
+            top_n_options=5,
+        )
+        if "error" not in cross:
+            return cross
 
     room_route = _resolve_room_intent_group(question)
     if room_route:
@@ -4046,6 +4112,36 @@ def build_direct_result_for_user_query(
         )
         if "error" not in broad:
             return broad
+
+    segment_first = _resolve_segment_first_comparison_request(cleaned)
+    if segment_first:
+        demo_id = str(segment_first["demo_id"])
+        subject_question = str(segment_first["subject_question"])
+        subject_room_route = _resolve_room_intent_group(subject_question)
+        if subject_room_route:
+            matrix = _build_question_group_by_demographic(
+                question=str(subject_room_route["question_text"]),
+                demo_id=demo_id,
+                top_n_items=24,
+                item_keywords=subject_room_route.get("item_keywords"),
+            )
+            if "error" not in matrix:
+                return matrix
+            cross = _build_question_by_demographic(
+                question=str(subject_room_route["question_text"]),
+                demo_id=demo_id,
+                top_n_options=5,
+            )
+            if "error" not in cross:
+                return cross
+
+        cross = _build_question_by_demographic(
+            question=subject_question,
+            demo_id=demo_id,
+            top_n_options=5,
+        )
+        if "error" not in cross:
+            return cross
 
     room_route = _resolve_room_intent_group(routed_question)
     if room_route:
