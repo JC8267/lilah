@@ -138,6 +138,8 @@ async def run_agent_loop(
     llm_override: dict[str, Any] | None = None,
     request_id: str | None = None,
     conversation_id: str | None = None,
+    active_filters: dict[str, str] | None = None,
+    cancel_event: asyncio.Event | None = None,
 ) -> AsyncGenerator[dict, None]:
     """
     Run the agent loop. Yields SSE event dicts:
@@ -153,6 +155,18 @@ async def run_agent_loop(
         if request_id:
             payload["request_id"] = request_id
         return payload
+
+    def _is_cancelled() -> bool:
+        return bool(cancel_event and cancel_event.is_set())
+
+    if _is_cancelled():
+        _log_struct(
+            logging.INFO,
+            "agent_loop_cancelled_before_start",
+            request_id=request_id,
+            conversation_id=conversation_id,
+        )
+        return
 
     try:
         llm_options = resolve_runtime_options(llm_override)
@@ -199,7 +213,10 @@ async def run_agent_loop(
             if m.get("role") == "user" and m.get("content"):
                 last_user_text = str(m.get("content"))
                 break
-        direct_result = build_direct_result_for_user_query(last_user_text)
+        direct_result = build_direct_result_for_user_query(
+            last_user_text,
+            active_filters=active_filters,
+        )
         if isinstance(direct_result, dict) and "error" not in direct_result:
             direct_tool = str(direct_result.get("analysis_type", "direct_analysis"))
             yield {"event": "status", "data": {"message": "Direct analysis path"}}
@@ -224,11 +241,28 @@ async def run_agent_loop(
             return
 
         for _ in range(settings.llm_max_iterations):
+            if _is_cancelled():
+                _log_struct(
+                    logging.INFO,
+                    "agent_loop_cancelled_iteration",
+                    request_id=request_id,
+                    conversation_id=conversation_id,
+                )
+                return
             turn = None
             last_error: Exception | None = None
 
             for model_id in model_candidates:
                 for attempt in range(llm_options.retry_attempts + 1):
+                    if _is_cancelled():
+                        _log_struct(
+                            logging.INFO,
+                            "agent_loop_cancelled_before_model_turn",
+                            request_id=request_id,
+                            conversation_id=conversation_id,
+                            model_id=model_id,
+                        )
+                        return
                     yield {
                         "event": "status",
                         "data": {
@@ -245,6 +279,15 @@ async def run_agent_loop(
                             max_tokens=llm_options.max_tokens,
                             timeout_seconds=llm_options.timeout_seconds,
                         )
+                        if _is_cancelled():
+                            _log_struct(
+                                logging.INFO,
+                                "agent_loop_cancelled_after_model_turn",
+                                request_id=request_id,
+                                conversation_id=conversation_id,
+                                model_id=model_id,
+                            )
+                            return
                         break
                     except Exception as e:
                         last_error = e
@@ -281,6 +324,15 @@ async def run_agent_loop(
             tool_uses = []
             blocked_repeated_call = False
             for tc in turn.tool_calls:
+                if _is_cancelled():
+                    _log_struct(
+                        logging.INFO,
+                        "agent_loop_cancelled_before_tool",
+                        request_id=request_id,
+                        conversation_id=conversation_id,
+                        tool=tc.name,
+                    )
+                    return
                 tool_started_at = time.perf_counter()
                 yield {
                     "event": "tool_start",
@@ -314,6 +366,7 @@ async def run_agent_loop(
                             handle_tool_call,
                             tc.name,
                             tc.input,
+                            active_filters,
                         )
                         try:
                             result_data = json.loads(result_str)
@@ -411,8 +464,19 @@ async def run_agent_loop(
                     break
 
         if loop_aborted and not full_text:
+            if _is_cancelled():
+                _log_struct(
+                    logging.INFO,
+                    "agent_loop_cancelled_before_rescue",
+                    request_id=request_id,
+                    conversation_id=conversation_id,
+                )
+                return
             # Rescue path: fall back to deterministic tool execution before returning an error-like message.
-            rescue_result = build_direct_result_for_user_query(last_user_text)
+            rescue_result = build_direct_result_for_user_query(
+                last_user_text,
+                active_filters=active_filters,
+            )
             if isinstance(rescue_result, dict) and "error" not in rescue_result:
                 rescue_chart = rescue_result.get("chart")
                 if isinstance(rescue_chart, dict):
@@ -429,6 +493,7 @@ async def run_agent_loop(
                         handle_tool_call,
                         "quick_insight",
                         {"question": last_user_text, "top_n": 8},
+                        active_filters,
                     )
                     quick = json.loads(quick_raw)
                 except Exception:
@@ -454,6 +519,7 @@ async def run_agent_loop(
                             handle_tool_call,
                             "search_questions",
                             {"keywords": last_user_text},
+                            active_filters,
                         )
                         sq = json.loads(sq_raw)
                     except Exception:
@@ -483,6 +549,15 @@ async def run_agent_loop(
         if full_text and not text_emitted and not full_text.isspace():
             # Ensure clients receive at least one text chunk when only fallback text exists.
             yield {"event": "text_delta", "data": {"content": full_text}}
+
+        if _is_cancelled():
+            _log_struct(
+                logging.INFO,
+                "agent_loop_cancelled_before_done",
+                request_id=request_id,
+                conversation_id=conversation_id,
+            )
+            return
 
         _log_struct(
             logging.INFO,

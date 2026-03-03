@@ -29,6 +29,10 @@ class Settings(BaseSettings):
     chat_filters_max_items: int = 12
     chat_filter_key_max_chars: int = 80
     chat_filter_value_max_chars: int = 200
+    chat_rate_limit_per_minute: int = 30
+    chat_max_active_streams_per_client: int = 2
+    chat_max_active_streams_global: int = 40
+    chat_disconnect_poll_ms: int = 300
     data_dir: Path = BACKEND_ROOT.parent / "normalized"
     sqlite_path: Path = BACKEND_ROOT / "lilah.db"
     max_query_rows: int = 200

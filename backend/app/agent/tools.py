@@ -15,6 +15,49 @@ def _escape_sql_literal(value: str) -> str:
     return value.replace("'", "''")
 
 
+def _normalize_active_filters(active_filters: dict[str, str] | None) -> dict[str, str]:
+    if not isinstance(active_filters, dict):
+        return {}
+
+    normalized: dict[str, str] = {}
+    for raw_demo_id, raw_demo_level in active_filters.items():
+        demo_id = str(raw_demo_id).strip()
+        demo_level = str(raw_demo_level).strip()
+        if not demo_id or not demo_level:
+            continue
+        normalized[demo_id] = demo_level
+    return normalized
+
+
+def _resolve_demo_clause(
+    *,
+    demo_level: str | None = None,
+    active_filters: dict[str, str] | None = None,
+) -> tuple[str, list[dict[str, str]]]:
+    """Resolve SQL demo slice clause with active filter precedence."""
+    normalized = _normalize_active_filters(active_filters)
+    if normalized:
+        # Filters are a mapping of demo_id -> demo_level. Use first item as active slice.
+        for demo_id, filter_level in normalized.items():
+            did_sql = _escape_sql_literal(demo_id)
+            lvl_sql = _escape_sql_literal(filter_level)
+            return (
+                f"demo_id = '{did_sql}' AND demo_level = '{lvl_sql}'",
+                [{"demo_id": demo_id, "demo_level": filter_level}],
+            )
+
+    if demo_level and demo_level.strip():
+        return (
+            f"demo_level = '{_escape_sql_literal(demo_level.strip())}'",
+            [],
+        )
+
+    return (
+        "demo_id = 'Total' AND demo_level = 'TOTAL: Total respondents'",
+        [],
+    )
+
+
 def _short_demo_label(demo_id: str) -> str:
     if ":" in demo_id:
         return demo_id.split(":", 1)[1].strip()
@@ -855,9 +898,12 @@ def _build_top_selected_for_question_group(
     item_label: str = "Item",
     summary_noun: str = "item",
     item_keywords: list[str] | None = None,
+    active_filters: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     top_n = max(3, min(int(top_n), 20))
     qg_sql = _escape_sql_literal(question_group)
+    demo_sql, applied_filters = _resolve_demo_clause(active_filters=active_filters)
+    demo_slice = applied_filters[0]["demo_level"] if applied_filters else "TOTAL: Total respondents"
 
     option_sql = f"""
         SELECT DISTINCT response_option
@@ -865,8 +911,7 @@ def _build_top_selected_for_question_group(
         WHERE question_group = '{qg_sql}'
           AND response_option IS NOT NULL
           AND TRIM(response_option) <> ''
-          AND demo_id = 'Total'
-          AND demo_level = 'TOTAL: Total respondents'
+          AND {demo_sql}
         ORDER BY response_option
     """
     option_result = execute_query(option_sql)
@@ -901,8 +946,7 @@ def _build_top_selected_for_question_group(
         FROM survey_long
         WHERE question_group = '{qg_sql}'
           AND LOWER(response_option) = LOWER('{pref_sql}')
-          AND demo_id = 'Total'
-          AND demo_level = 'TOTAL: Total respondents'
+          AND {demo_sql}
           {item_filter_sql}
         GROUP BY item
         ORDER BY percent DESC
@@ -922,8 +966,7 @@ def _build_top_selected_for_question_group(
             FROM survey_long
             WHERE question_group = '{qg_sql}'
               AND LOWER(response_option) = LOWER('{pref_sql}')
-              AND demo_id = 'Total'
-              AND demo_level = 'TOTAL: Total respondents'
+              AND {demo_sql}
             GROUP BY item
             ORDER BY percent DESC
             LIMIT {top_n}
@@ -963,7 +1006,7 @@ def _build_top_selected_for_question_group(
         "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
         "title": {
             "text": f"{title_prefix} — {title_room}",
-            "subtitle": f"{question_group} · Response basis: {preferred}",
+            "subtitle": f"{question_group} · Response basis: {preferred} · Slice: {demo_slice}",
             "anchor": "start",
         },
         "data": {"values": chart_values},
@@ -1017,7 +1060,12 @@ def _build_top_selected_for_question_group(
         )
     lines.append(f"- Concentration: top 3 items sum to **{top3_sum:.2f}%**.")
     lines.append(f"- Spread across shown items: **{spread:.2f} pts**.")
-    lines.append(f"- Response basis: **{preferred}** among total respondents.")
+    lines.append(f"- Response basis: **{preferred}** in **{demo_slice}**.")
+    if applied_filters:
+        af = applied_filters[0]
+        lines.append(
+            f"- Active filter applied: **{af['demo_id']} = {af['demo_level']}**."
+        )
     if clean_item_keywords:
         lines.append(f"- Filtered to items matching: {', '.join(sorted(set(clean_item_keywords)))}.")
 
@@ -1030,6 +1078,7 @@ def _build_top_selected_for_question_group(
         "row_count": len(chart_values),
         "top_rows": chart_values,
         "item_keywords": clean_item_keywords or None,
+        "applied_filters": applied_filters,
         "sql": data_sql.strip(),
         "insight_text": "\n".join(lines),
         "chart": chart_spec,
@@ -2194,7 +2243,12 @@ def build_unanswerable_result_for_user_query(
     )
 
 
-def _build_quick_insight(question: str, demo_level: str | None = None, top_n: int = 8) -> dict[str, Any]:
+def _build_quick_insight(
+    question: str,
+    demo_level: str | None = None,
+    top_n: int = 8,
+    active_filters: dict[str, str] | None = None,
+) -> dict[str, Any]:
     """Fast path: search question -> fetch top response options -> create chart spec."""
     extreme_request = _resolve_extreme_difference_request(question)
     if extreme_request:
@@ -2220,6 +2274,7 @@ def _build_quick_insight(question: str, demo_level: str | None = None, top_n: in
             item_label=str(room_route.get("item_label", "Item")),
             summary_noun=str(room_route.get("summary_noun", "item")),
             item_keywords=room_route.get("item_keywords"),
+            active_filters=active_filters,
         )
 
     if _is_age_homeownership_intent(question):
@@ -2265,10 +2320,13 @@ def _build_quick_insight(question: str, demo_level: str | None = None, top_n: in
     top_n = max(3, min(int(top_n), 20))
     qid_sql = _escape_sql_literal(question_id)
 
-    if demo_level and demo_level.strip():
-        demo_sql = f"demo_level = '{_escape_sql_literal(demo_level.strip())}'"
-    else:
-        demo_sql = "demo_id = 'Total' AND demo_level = 'TOTAL: Total respondents'"
+    demo_sql, applied_filters = _resolve_demo_clause(
+        demo_level=demo_level,
+        active_filters=active_filters,
+    )
+    demo_slice = applied_filters[0]["demo_level"] if applied_filters else (
+        demo_level.strip() if demo_level and demo_level.strip() else "TOTAL: Total respondents"
+    )
 
     sql = f"""
         SELECT
@@ -2335,7 +2393,11 @@ def _build_quick_insight(question: str, demo_level: str | None = None, top_n: in
 
     chart_spec: dict[str, Any] = {
         "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
-        "title": {"text": chart_title, "subtitle": question_id, "anchor": "start"},
+        "title": {
+            "text": chart_title,
+            "subtitle": f"{question_id} · Slice: {demo_slice}",
+            "anchor": "start",
+        },
         "data": {"values": chart_values},
         "height": {"step": 30},
         "encoding": {
@@ -2404,6 +2466,11 @@ def _build_quick_insight(question: str, demo_level: str | None = None, top_n: in
     summary_lines.append(
         f"- Spread between highest and lowest shown options: **{spread:.2f} pts**."
     )
+    if applied_filters:
+        af = applied_filters[0]
+        summary_lines.append(
+            f"- Active filter applied: **{af['demo_id']} = {af['demo_level']}**."
+        )
     summary_lines.append("- Values shown are percentages of respondents.")
     insight_text = "\n".join(summary_lines)
 
@@ -2413,6 +2480,7 @@ def _build_quick_insight(question: str, demo_level: str | None = None, top_n: in
         "sql": sql.strip(),
         "row_count": len(chart_values),
         "top_rows": chart_values,
+        "applied_filters": applied_filters,
         "insight_text": insight_text,
         "chart": chart_spec,
     }
@@ -3318,7 +3386,10 @@ def _build_question_group_by_demographic(
     }
 
 
-def build_direct_result_for_user_query(user_message: str) -> dict[str, Any] | None:
+def build_direct_result_for_user_query(
+    user_message: str,
+    active_filters: dict[str, str] | None = None,
+) -> dict[str, Any] | None:
     """Optional deterministic route for common demographic asks."""
     if not user_message:
         return None
@@ -3357,6 +3428,7 @@ def build_direct_result_for_user_query(user_message: str) -> dict[str, Any] | No
             item_label=str(room_route.get("item_label", "Item")),
             summary_noun=str(room_route.get("summary_noun", "item")),
             item_keywords=room_route.get("item_keywords"),
+            active_filters=active_filters,
         )
 
     has_income = "income" in q
@@ -3394,7 +3466,11 @@ def build_direct_result_for_user_query(user_message: str) -> dict[str, Any] | No
         )
 
     if _is_home_size_intent(cleaned):
-        quick = _build_quick_insight(question=cleaned, top_n=8)
+        quick = _build_quick_insight(
+            question=cleaned,
+            top_n=8,
+            active_filters=active_filters,
+        )
         if "error" not in quick:
             return quick
 
@@ -3659,13 +3735,18 @@ TOOL_DEFINITIONS = [
 ]
 
 
-def handle_tool_call(tool_name: str, tool_input: dict) -> str:
+def handle_tool_call(
+    tool_name: str,
+    tool_input: dict,
+    active_filters: dict[str, str] | None = None,
+) -> str:
     """Execute a tool call and return JSON string result."""
     if tool_name == "quick_insight":
         result = _build_quick_insight(
             question=str(tool_input.get("question", "")),
             demo_level=tool_input.get("demo_level"),
             top_n=int(tool_input.get("top_n", 8)),
+            active_filters=active_filters,
         )
     elif tool_name == "demographic_breakout":
         raw_demo_ids = tool_input.get("demo_ids", [])
