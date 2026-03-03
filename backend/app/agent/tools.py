@@ -1150,7 +1150,7 @@ def _has_comparison_intent(text: str) -> bool:
     )
 
 
-def _resolve_segment_first_comparison_request(text: str) -> dict[str, str] | None:
+def _resolve_segment_first_comparison_request(text: str) -> dict[str, Any] | None:
     """Parse phrasing like: 'compare <segment> vs <other> for <topic>'."""
     cleaned = (text or "").strip()
     if not cleaned:
@@ -1176,10 +1176,31 @@ def _resolve_segment_first_comparison_request(text: str) -> dict[str, str] | Non
     if not demo_id:
         return None
 
+    split_match = re.search(r"\s+(?:vs|versus)\s+", segment_expr, flags=re.IGNORECASE)
+    left_segment = segment_expr
+    right_segment = ""
+    if split_match:
+        left_segment = segment_expr[: split_match.start()].strip(" ?.")
+        right_segment = segment_expr[split_match.end() :].strip(" ?.")
+
+    left_has_other = bool(re.search(r"\bother(s)?\b", left_segment, flags=re.IGNORECASE))
+    right_has_other = bool(re.search(r"\bother(s)?\b", right_segment, flags=re.IGNORECASE))
+    compare_to_others = False
+    target_segment_expr = left_segment or segment_expr
+    if right_segment:
+        if right_has_other and not left_has_other:
+            compare_to_others = True
+            target_segment_expr = left_segment or segment_expr
+        elif left_has_other and not right_has_other:
+            compare_to_others = True
+            target_segment_expr = right_segment
+
     return {
         "segment_expr": segment_expr,
         "subject_question": subject_question,
         "demo_id": demo_id,
+        "compare_to_others": compare_to_others,
+        "target_segment_expr": target_segment_expr,
     }
 
 
@@ -2824,6 +2845,16 @@ def _build_quick_insight(
     if segment_first:
         demo_id = str(segment_first["demo_id"])
         subject_question = str(segment_first["subject_question"])
+        compare_to_others = bool(segment_first.get("compare_to_others"))
+        target_demo_level: str | None = None
+        if compare_to_others:
+            target_hint = str(
+                segment_first.get("target_segment_expr")
+                or segment_first.get("segment_expr")
+                or subject_question
+            )
+            target_demo_level = _resolve_target_demo_level_for_query(demo_id, target_hint)
+        apply_target_comparison = bool(compare_to_others and target_demo_level)
         subject_room_route = _resolve_room_intent_group(subject_question)
         if subject_room_route:
             matrix = _build_question_group_by_demographic(
@@ -2831,6 +2862,8 @@ def _build_quick_insight(
                 demo_id=demo_id,
                 top_n_items=24,
                 item_keywords=subject_room_route.get("item_keywords"),
+                target_demo_level=target_demo_level,
+                compare_to_others=apply_target_comparison,
             )
             if "error" not in matrix:
                 return matrix
@@ -2838,6 +2871,8 @@ def _build_quick_insight(
                 question=str(subject_room_route["question_text"]),
                 demo_id=demo_id,
                 top_n_options=5,
+                target_demo_level=target_demo_level,
+                compare_to_others=apply_target_comparison,
             )
             if "error" not in cross:
                 return cross
@@ -2846,6 +2881,8 @@ def _build_quick_insight(
             question=subject_question,
             demo_id=demo_id,
             top_n_options=5,
+            target_demo_level=target_demo_level,
+            compare_to_others=apply_target_comparison,
         )
         if "error" not in cross:
             return cross
@@ -3316,7 +3353,11 @@ def _build_demographic_breakout(demo_ids: list[str], top_n: int = 8) -> dict[str
 
 
 def _build_question_by_demographic(
-    question: str, demo_id: str, top_n_options: int = 5
+    question: str,
+    demo_id: str,
+    top_n_options: int = 5,
+    target_demo_level: str | None = None,
+    compare_to_others: bool = False,
 ) -> dict[str, Any]:
     search_result = search_questions(question)
     if "error" in search_result:
@@ -3459,6 +3500,161 @@ def _build_question_by_demographic(
             "question_text": question_text,
             "demo_id": demo_id,
         }
+
+    if compare_to_others and target_demo_level:
+        target_group = _short_demo_level(target_demo_level)
+        option_stats: list[dict[str, Any]] = []
+        for opt, vals in option_levels.items():
+            target_candidates = [v for v in vals if v[0] == target_group]
+            if not target_candidates:
+                continue
+            target = target_candidates[0]
+            others = [v for v in vals if v[0] != target_group]
+            if not others:
+                continue
+
+            other_percent = sum(v for _, v, _ in others) / float(len(others))
+            other_moe_values = [m for _, _, m in others if m is not None]
+            other_moe = (
+                sum(other_moe_values) / float(len(other_moe_values))
+                if other_moe_values
+                else None
+            )
+
+            delta_points = target[1] - other_percent
+            abs_delta_points = abs(delta_points)
+            combined_moe: float | None = None
+            is_significant = False
+            if target[2] is not None and other_moe is not None:
+                combined_moe = (target[2] ** 2 + other_moe ** 2) ** 0.5
+                is_significant = abs_delta_points > combined_moe
+
+            option_stats.append(
+                {
+                    "option": opt,
+                    "target_percent": target[1],
+                    "others_percent": other_percent,
+                    "delta_points": delta_points,
+                    "abs_delta_points": abs_delta_points,
+                    "target_moe": target[2],
+                    "others_moe": other_moe,
+                    "combined_moe": combined_moe,
+                    "is_significant": is_significant,
+                }
+            )
+
+        if option_stats:
+            option_stats.sort(key=lambda x: x["abs_delta_points"], reverse=True)
+            top = option_stats[0]
+            significant_diffs = [x for x in option_stats if x["is_significant"]]
+            missing_moe_count = sum(1 for x in option_stats if x["combined_moe"] is None)
+
+            demo_label = _short_demo_label(demo_id)
+            direction = "higher" if top["delta_points"] >= 0 else "lower"
+            narrative_lines = [
+                f"**{question_id} — {question_text} ({target_group} vs other {demo_label.lower()} groups)**",
+                f"- Largest gap for **{target_group}**: **{top['option']}** at **{top['target_percent']:.2f}%** vs others **{top['others_percent']:.2f}%** "
+                f"(**{top['delta_points']:+.2f} pts**, {direction}).",
+                f"- Significant option-level differences for this comparison (~95%): **{len(significant_diffs)}/{len(option_stats)}**.",
+                "- 'Other groups' are the average of remaining demographic levels in this dimension.",
+            ]
+            if missing_moe_count > 0:
+                narrative_lines.append(
+                    f"- Significance unavailable for **{missing_moe_count}** option(s) due to missing MOE values."
+                )
+            if significant_diffs:
+                for d in significant_diffs:
+                    narrative_lines.append(
+                        f"- **{d['option']}**: {target_group} {d['target_percent']:.2f}% vs others {d['others_percent']:.2f}% "
+                        f"(delta {d['delta_points']:+.2f} pts; combined MOE {d['combined_moe']:.2f} pts)."
+                    )
+
+            chart_target_values = [
+                {
+                    "response_option": _truncate_label(str(row["option"]), 38),
+                    "delta_points": round(float(row["delta_points"]), 2),
+                    "abs_delta_points": round(float(row["abs_delta_points"]), 2),
+                    "target_percent": round(float(row["target_percent"]), 2),
+                    "others_percent": round(float(row["others_percent"]), 2),
+                    "significant": "Significant" if row["is_significant"] else "Not significant",
+                    "combined_moe_points": (
+                        round(float(row["combined_moe"]), 2)
+                        if row["combined_moe"] is not None
+                        else None
+                    ),
+                }
+                for row in option_stats
+            ]
+            max_abs = max(abs(v["delta_points"]) for v in chart_target_values)
+            max_abs = max(max_abs, 1.0)
+            chart_spec = {
+                "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+                "title": {
+                    "text": question_text if len(question_text) <= 72 else question_text[:69] + "\u2026",
+                    "subtitle": f"{question_id} · {target_group} vs others ({demo_label})",
+                    "anchor": "start",
+                },
+                "data": {"values": chart_target_values},
+                "mark": {"type": "bar", "cornerRadiusEnd": 4},
+                "encoding": {
+                    "y": {
+                        "field": "response_option",
+                        "type": "nominal",
+                        "sort": "-x",
+                        "title": None,
+                        "axis": {"labelLimit": 320, "labelFontSize": 11},
+                    },
+                    "x": {
+                        "field": "delta_points",
+                        "type": "quantitative",
+                        "title": f"{target_group} minus others (pts)",
+                        "scale": {"domain": [-(max_abs * 1.2), max_abs * 1.2]},
+                        "axis": {"format": "+.1f", "grid": True},
+                    },
+                    "color": {
+                        "field": "significant",
+                        "type": "nominal",
+                        "scale": {
+                            "domain": ["Significant", "Not significant"],
+                            "range": [_BRAND_BLUE, "#9ca3af"],
+                        },
+                        "legend": {"orient": "top-right"},
+                    },
+                    "tooltip": [
+                        {"field": "response_option", "type": "nominal", "title": "Option"},
+                        {"field": "target_percent", "type": "quantitative", "title": f"{target_group} %", "format": ".2f"},
+                        {"field": "others_percent", "type": "quantitative", "title": "Others %", "format": ".2f"},
+                        {"field": "delta_points", "type": "quantitative", "title": "Delta (pts)", "format": "+.2f"},
+                        {"field": "combined_moe_points", "type": "quantitative", "title": "Combined MOE (pts)", "format": ".2f"},
+                        {"field": "significant", "type": "nominal", "title": "Significance"},
+                    ],
+                },
+                "config": _CHART_CONFIG,
+            }
+
+            return {
+                "analysis_type": "question_by_demographic_target_vs_others",
+                "question_id": question_id,
+                "question_text": question_text,
+                "demo_id": demo_id,
+                "target_demo_level": target_demo_level,
+                "comparison": "target_vs_others",
+                "row_count": len(chart_target_values),
+                "significant_differences": [
+                    {
+                        "response_option": d["option"],
+                        "target_group": target_group,
+                        "target_percent": round(d["target_percent"], 2),
+                        "others_percent": round(d["others_percent"], 2),
+                        "delta_points": round(d["delta_points"], 2),
+                        "combined_moe_points": round(d["combined_moe"], 2),
+                    }
+                    for d in significant_diffs
+                    if d["combined_moe"] is not None
+                ],
+                "insight_text": "\n".join(narrative_lines),
+                "chart": chart_spec,
+            }
 
     option_avgs = {
         opt: sum(v for _, v, _ in vals) / max(len(vals), 1)
@@ -3695,6 +3891,8 @@ def _build_question_group_by_demographic(
     demo_id: str,
     top_n_items: int = 20,
     item_keywords: list[str] | None = None,
+    target_demo_level: str | None = None,
+    compare_to_others: bool = False,
 ) -> dict[str, Any]:
     """Cross-tab a matrix-like question group (e.g., IKEA102 items) by demographic."""
     search_result = search_questions(question)
@@ -3833,6 +4031,167 @@ def _build_question_group_by_demographic(
 
     if not item_values:
         return {"error": "No usable numeric matrix rows returned.", "question_group": question_group}
+
+    if compare_to_others and target_demo_level:
+        target_group = _short_demo_level(target_demo_level)
+        item_stats_target: list[dict[str, Any]] = []
+        for item, vals in item_values.items():
+            target_candidates = [v for v in vals if v[0] == target_group]
+            if not target_candidates:
+                continue
+            target = target_candidates[0]
+            others = [v for v in vals if v[0] != target_group]
+            if not others:
+                continue
+
+            others_percent = sum(v for _, v, _ in others) / float(len(others))
+            others_moe_values = [m for _, _, m in others if m is not None]
+            others_moe = (
+                sum(others_moe_values) / float(len(others_moe_values))
+                if others_moe_values
+                else None
+            )
+
+            delta_points = target[1] - others_percent
+            abs_gap = abs(delta_points)
+            combined_moe: float | None = None
+            is_significant = False
+            if target[2] is not None and others_moe is not None:
+                combined_moe = (target[2] ** 2 + others_moe ** 2) ** 0.5
+                is_significant = abs_gap > combined_moe
+
+            item_stats_target.append(
+                {
+                    "item": item,
+                    "target_percent": target[1],
+                    "others_percent": others_percent,
+                    "delta_points": delta_points,
+                    "abs_gap": abs_gap,
+                    "combined_moe": combined_moe,
+                    "is_significant": is_significant,
+                }
+            )
+
+        if item_stats_target:
+            item_stats_target.sort(key=lambda x: x["abs_gap"], reverse=True)
+            significant = [x for x in item_stats_target if x["is_significant"]]
+            missing_moe = [x for x in item_stats_target if x["combined_moe"] is None]
+            top_item = item_stats_target[0]
+            demo_label = _short_demo_label(demo_id)
+            direction = "higher" if top_item["delta_points"] >= 0 else "lower"
+            narrative_lines = [
+                f"**{question_group} matrix — {question_text} ({target_group} vs other {demo_label.lower()} groups)**",
+                f"- Response basis: **{preferred}**.",
+                f"- Analyzed **{len(item_stats_target)}** items for **{target_group}** vs all other {demo_label.lower()} groups.",
+                f"- Largest item gap for **{target_group}**: **{top_item['item']}** at **{top_item['target_percent']:.2f}%** vs others **{top_item['others_percent']:.2f}%** "
+                f"(**{top_item['delta_points']:+.2f} pts**, {direction}).",
+                f"- Items with statistically significant differences (~95%): **{len(significant)}**.",
+                "- 'Other groups' are the average of remaining demographic levels.",
+            ]
+            if clean_item_keywords:
+                narrative_lines.append(
+                    f"- Item filter applied: {', '.join(sorted(set(clean_item_keywords)))}."
+                )
+            if significant:
+                for s in significant:
+                    narrative_lines.append(
+                        f"- **{s['item']}**: {target_group} {s['target_percent']:.2f}% vs others {s['others_percent']:.2f}% "
+                        f"(delta {s['delta_points']:+.2f} pts; combined MOE {s['combined_moe']:.2f} pts)."
+                    )
+            if missing_moe:
+                narrative_lines.append(
+                    f"- Significance unavailable for **{len(missing_moe)}** items because MOE values were missing."
+                )
+            narrative_lines.append(
+                "- Significance uses source-tab MOE fields; treat as directional when reviewing many items."
+            )
+
+            chart_values = [
+                {
+                    "item": _truncate_label(s["item"], 44),
+                    "delta_points": round(float(s["delta_points"]), 2),
+                    "abs_gap_points": round(float(s["abs_gap"]), 2),
+                    "significant": "Significant" if s["is_significant"] else "Not significant",
+                    "target_percent": round(float(s["target_percent"]), 2),
+                    "others_percent": round(float(s["others_percent"]), 2),
+                    "combined_moe_points": round(float(s["combined_moe"]), 2) if s["combined_moe"] is not None else None,
+                }
+                for s in item_stats_target
+            ]
+
+            max_abs = max(abs(v["delta_points"]) for v in chart_values)
+            max_abs = max(max_abs, 1.0)
+            chart_spec = {
+                "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+                "title": {
+                    "text": f"{question_group} differences for {target_group}",
+                    "subtitle": f"Response: {preferred} · vs other {demo_label.lower()} groups",
+                    "anchor": "start",
+                },
+                "data": {"values": chart_values},
+                "mark": {"type": "bar", "cornerRadiusEnd": 4},
+                "encoding": {
+                    "y": {
+                        "field": "item",
+                        "type": "nominal",
+                        "sort": "-x",
+                        "title": None,
+                        "axis": {"labelLimit": 350},
+                    },
+                    "x": {
+                        "field": "delta_points",
+                        "type": "quantitative",
+                        "title": f"{target_group} minus others (pts)",
+                        "scale": {"domain": [-(max_abs * 1.2), max_abs * 1.2]},
+                        "axis": {"format": "+.1f", "grid": True},
+                    },
+                    "color": {
+                        "field": "significant",
+                        "type": "nominal",
+                        "legend": {"orient": "top-right"},
+                        "scale": {
+                            "domain": ["Significant", "Not significant"],
+                            "range": [_BRAND_BLUE, "#9ca3af"],
+                        },
+                    },
+                    "tooltip": [
+                        {"field": "item", "type": "nominal", "title": "Item"},
+                        {"field": "target_percent", "type": "quantitative", "title": f"{target_group} %", "format": ".2f"},
+                        {"field": "others_percent", "type": "quantitative", "title": "Others %", "format": ".2f"},
+                        {"field": "delta_points", "type": "quantitative", "title": "Delta (pts)", "format": "+.2f"},
+                        {"field": "combined_moe_points", "type": "quantitative", "title": "Combined MOE (pts)", "format": ".2f"},
+                        {"field": "significant", "type": "nominal", "title": "Significance"},
+                    ],
+                },
+                "config": _CHART_CONFIG,
+            }
+
+            return {
+                "analysis_type": "question_group_by_demographic_target_vs_others",
+                "question_group": question_group,
+                "question_text": question_text,
+                "demo_id": demo_id,
+                "target_demo_level": target_demo_level,
+                "comparison": "target_vs_others",
+                "selected_response_option": preferred,
+                "item_keywords": clean_item_keywords or None,
+                "item_count": len(item_stats_target),
+                "significant_item_count": len(significant),
+                "significant_differences": [
+                    {
+                        "item": s["item"],
+                        "target_group": target_group,
+                        "target_percent": round(s["target_percent"], 2),
+                        "others_percent": round(s["others_percent"], 2),
+                        "delta_points": round(s["delta_points"], 2),
+                        "combined_moe_points": round(s["combined_moe"], 2),
+                    }
+                    for s in significant
+                    if s["combined_moe"] is not None
+                ],
+                "insight_text": "\n".join(narrative_lines),
+                "chart": chart_spec,
+            }
 
     item_stats: list[dict[str, Any]] = []
     for item, vals in item_values.items():
@@ -4117,6 +4476,16 @@ def build_direct_result_for_user_query(
     if segment_first:
         demo_id = str(segment_first["demo_id"])
         subject_question = str(segment_first["subject_question"])
+        compare_to_others = bool(segment_first.get("compare_to_others"))
+        target_demo_level: str | None = None
+        if compare_to_others:
+            target_hint = str(
+                segment_first.get("target_segment_expr")
+                or segment_first.get("segment_expr")
+                or subject_question
+            )
+            target_demo_level = _resolve_target_demo_level_for_query(demo_id, target_hint)
+        apply_target_comparison = bool(compare_to_others and target_demo_level)
         subject_room_route = _resolve_room_intent_group(subject_question)
         if subject_room_route:
             matrix = _build_question_group_by_demographic(
@@ -4124,6 +4493,8 @@ def build_direct_result_for_user_query(
                 demo_id=demo_id,
                 top_n_items=24,
                 item_keywords=subject_room_route.get("item_keywords"),
+                target_demo_level=target_demo_level,
+                compare_to_others=apply_target_comparison,
             )
             if "error" not in matrix:
                 return matrix
@@ -4131,6 +4502,8 @@ def build_direct_result_for_user_query(
                 question=str(subject_room_route["question_text"]),
                 demo_id=demo_id,
                 top_n_options=5,
+                target_demo_level=target_demo_level,
+                compare_to_others=apply_target_comparison,
             )
             if "error" not in cross:
                 return cross
@@ -4139,6 +4512,8 @@ def build_direct_result_for_user_query(
             question=subject_question,
             demo_id=demo_id,
             top_n_options=5,
+            target_demo_level=target_demo_level,
+            compare_to_others=apply_target_comparison,
         )
         if "error" not in cross:
             return cross

@@ -24,6 +24,8 @@ class SegmentFirstComparisonTests(unittest.TestCase):
         assert parsed is not None
         self.assertEqual(parsed.get("demo_id"), "TOTAL: Age")
         self.assertEqual(parsed.get("subject_question"), "top challenges of the home")
+        self.assertTrue(parsed.get("compare_to_others"))
+        self.assertEqual(parsed.get("target_segment_expr"), "ages 18-34")
 
     def test_direct_route_prefers_demographic_matrix_for_segment_first(self):
         payload = {
@@ -39,6 +41,7 @@ class SegmentFirstComparisonTests(unittest.TestCase):
         }
 
         with (
+            patch.object(tools, "_resolve_target_demo_level_for_query", return_value="TOTAL: Age 18-34"),
             patch.object(tools, "_resolve_room_intent_group", return_value=room_route),
             patch.object(tools, "_build_question_group_by_demographic", return_value=payload) as mocked_matrix,
         ):
@@ -48,6 +51,9 @@ class SegmentFirstComparisonTests(unittest.TestCase):
 
         self.assertEqual(result, payload)
         mocked_matrix.assert_called_once()
+        _, kwargs = mocked_matrix.call_args
+        self.assertEqual(kwargs.get("target_demo_level"), "TOTAL: Age 18-34")
+        self.assertTrue(kwargs.get("compare_to_others"))
 
     def test_unanswerable_guard_skips_segment_first_comparison(self):
         with (
