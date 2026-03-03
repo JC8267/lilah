@@ -1,12 +1,10 @@
-import { useCallback } from 'react';
+import { useCallback, useEffect, useRef } from 'react';
 import { useChatStore } from '../stores/chat-store';
 import { useFilterStore } from '../stores/filter-store';
-import type { Message } from '../types';
+import type { Message, VegaLiteSpec } from '../types';
 
 export function useChat() {
   const {
-    activeConversationId,
-    isStreaming,
     startStreaming,
     appendStreamingText,
     addStreamingChart,
@@ -19,14 +17,28 @@ export function useChat() {
   } = useChatStore();
 
   const activeFilters = useFilterStore((s) => s.activeFilters);
+  const abortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    return () => {
+      abortRef.current?.abort();
+      abortRef.current = null;
+    };
+  }, []);
 
   const sendMessage = useCallback(
     async (text: string) => {
-      if (isStreaming || !text.trim()) return;
+      if (!text.trim()) return;
+
+      const current = useChatStore.getState();
+      if (current.isStreaming) {
+        abortRef.current?.abort();
+      }
+      const conversationId = current.activeConversationId;
 
       const userMsg: Message = {
         id: crypto.randomUUID(),
-        conversation_id: activeConversationId || '',
+        conversation_id: conversationId || '',
         role: 'user',
         content: text,
         created_at: new Date().toISOString(),
@@ -39,32 +51,41 @@ export function useChat() {
         filters[f.demo_id] = f.demo_level;
       }
 
+      const controller = new AbortController();
+      abortRef.current = controller;
+      const finishIfActive = (finalText: string, finalCharts: VegaLiteSpec[]) => {
+        if (abortRef.current !== controller) return;
+        finishStreaming(finalText, finalCharts);
+        abortRef.current = null;
+      };
+
       try {
         const res = await fetch('/api/chat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
+          signal: controller.signal,
           body: JSON.stringify({
-            conversation_id: activeConversationId,
+            conversation_id: conversationId,
             message: text,
             filters: activeFilters.length > 0 ? filters : undefined,
           }),
         });
 
         if (!res.ok) {
-          finishStreaming(`Error: ${res.statusText}`, []);
+          finishIfActive(`Error: ${res.statusText}`, []);
           return;
         }
 
         const reader = res.body?.getReader();
         if (!reader) {
-          finishStreaming('Error: No response body', []);
+          finishIfActive('Error: No response body', []);
           return;
         }
 
         const decoder = new TextDecoder();
         let buffer = '';
         let collectedText = '';
-        const collectedCharts: Record<string, unknown>[] = [];
+        const collectedCharts: VegaLiteSpec[] = [];
         let lastEventAt = Date.now();
         const streamTimeoutMs = 90000;
         let terminalEventSeen = false;
@@ -137,7 +158,8 @@ export function useChat() {
 
                 case 'conversation':
                   if (data.id && data.title) {
-                    if (!activeConversationId) {
+                    const activeIdNow = useChatStore.getState().activeConversationId;
+                    if (!activeIdNow) {
                       setActiveConversation(data.id as string);
                       addConversation({
                         id: data.id as string,
@@ -156,7 +178,7 @@ export function useChat() {
 
                 case 'done':
                   terminalEventSeen = true;
-                  finishStreaming(
+                  finishIfActive(
                     collectedText || (typeof data.text === 'string' ? data.text : ''),
                     collectedCharts.length > 0
                       ? collectedCharts
@@ -168,7 +190,7 @@ export function useChat() {
 
                 case 'error':
                   terminalEventSeen = true;
-                  finishStreaming(
+                  finishIfActive(
                     `Error: ${data.message || 'Unknown error'}`,
                     []
                   );
@@ -181,7 +203,7 @@ export function useChat() {
           }
 
           if (Date.now() - lastEventAt > streamTimeoutMs) {
-            finishStreaming('Error: Stream timed out waiting for response.', collectedCharts);
+            finishIfActive('Error: Stream timed out waiting for response.', collectedCharts);
             return;
           }
         }
@@ -189,21 +211,25 @@ export function useChat() {
         // If stream ended without done/error, always terminate client streaming state.
         if (!terminalEventSeen) {
           if (collectedText || collectedCharts.length > 0) {
-            finishStreaming(collectedText, collectedCharts);
+            finishIfActive(collectedText, collectedCharts);
           } else {
-            finishStreaming(
+            finishIfActive(
               'Error: Stream ended before a final response was received.',
               []
             );
           }
         }
       } catch (err) {
-        finishStreaming(`Error: ${err instanceof Error ? err.message : 'Network error'}`, []);
+        if (err instanceof DOMException && err.name === 'AbortError') {
+          if (abortRef.current === controller) {
+            abortRef.current = null;
+          }
+          return;
+        }
+        finishIfActive(`Error: ${err instanceof Error ? err.message : 'Network error'}`, []);
       }
     },
     [
-      activeConversationId,
-      isStreaming,
       activeFilters,
       startStreaming,
       appendStreamingText,

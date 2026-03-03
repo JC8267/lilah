@@ -8,7 +8,7 @@ from typing import Any
 
 from app.agent.provider import get_provider, resolve_runtime_options
 from app.config import settings
-from app.db.duckdb_engine import execute_query, search_questions
+from app.db.duckdb_engine import execute_query, execute_query_params, search_questions
 
 
 def _escape_sql_literal(value: str) -> str:
@@ -897,7 +897,7 @@ def _build_top_selected_for_question_group(
     data_sql = f"""
         SELECT
             COALESCE(NULLIF(TRIM(question_level), ''), question_id) AS item,
-            100.0 * AVG(TRY_CAST(response_value AS DOUBLE)) AS percent
+            100.0 * AVG(response_value_num) AS percent
         FROM survey_long
         WHERE question_group = '{qg_sql}'
           AND LOWER(response_option) = LOWER('{pref_sql}')
@@ -918,7 +918,7 @@ def _build_top_selected_for_question_group(
         data_sql = f"""
             SELECT
                 COALESCE(NULLIF(TRIM(question_level), ''), question_id) AS item,
-                100.0 * AVG(TRY_CAST(response_value AS DOUBLE)) AS percent
+                100.0 * AVG(response_value_num) AS percent
             FROM survey_long
             WHERE question_group = '{qg_sql}'
               AND LOWER(response_option) = LOWER('{pref_sql}')
@@ -1159,9 +1159,8 @@ def _resolve_demo_id_from_text(text: str) -> str | None:
     if not tokens:
         return None
 
-    where = " OR ".join(
-        f"LOWER(demo_id) LIKE '%{_escape_sql_literal(t)}%'" for t in tokens[:4]
-    )
+    patterns = [f"%{t}%" for t in tokens[:4]]
+    where = " OR ".join("LOWER(demo_id) LIKE ?" for _ in patterns)
     sql = f"""
         SELECT DISTINCT demo_id
         FROM survey_long
@@ -1175,7 +1174,7 @@ def _resolve_demo_id_from_text(text: str) -> str | None:
             demo_id
         LIMIT 10
     """
-    result = execute_query(sql)
+    result = execute_query_params(sql, patterns)
     if "error" in result:
         return None
     rows = result.get("rows", [])
@@ -1459,9 +1458,9 @@ def _build_extreme_difference_by_demographic(
                     demo_id,
                     demo_level,
                     COALESCE(NULLIF(TRIM(question_level), ''), question_id) AS response_option,
-                    AVG(TRY_CAST(response_value AS DOUBLE)) AS response_value,
-                    AVG(TRY_CAST(weighted_margin_of_error AS DOUBLE)) AS weighted_moe,
-                    AVG(TRY_CAST(unweighted_margin_of_error AS DOUBLE)) AS unweighted_moe
+                    AVG(response_value_num) AS response_value,
+                    AVG(weighted_margin_of_error_num) AS weighted_moe,
+                    AVG(unweighted_margin_of_error_num) AS unweighted_moe
                 FROM survey_long
                 WHERE question_group = '{qg_sql}'
                   AND response_option IS NOT NULL
@@ -1527,9 +1526,9 @@ def _build_extreme_difference_by_demographic(
                     demo_id,
                     demo_level,
                     response_option,
-                    AVG(TRY_CAST(response_value AS DOUBLE)) AS response_value,
-                    AVG(TRY_CAST(weighted_margin_of_error AS DOUBLE)) AS weighted_moe,
-                    AVG(TRY_CAST(unweighted_margin_of_error AS DOUBLE)) AS unweighted_moe
+                    AVG(response_value_num) AS response_value,
+                    AVG(weighted_margin_of_error_num) AS weighted_moe,
+                    AVG(unweighted_margin_of_error_num) AS unweighted_moe
                 FROM survey_long
                 WHERE question_id = '{qid_sql}'
                   AND response_option IS NOT NULL
@@ -2274,13 +2273,13 @@ def _build_quick_insight(question: str, demo_level: str | None = None, top_n: in
     sql = f"""
         SELECT
             response_option,
-            AVG(TRY_CAST(response_value AS DOUBLE)) AS response_value
+            AVG(response_value_num) AS response_value
         FROM survey_long
         WHERE question_id = '{qid_sql}'
           AND {demo_sql}
           AND response_option IS NOT NULL
           AND TRIM(response_option) <> ''
-          AND TRY_CAST(response_value AS DOUBLE) IS NOT NULL
+          AND response_value_num IS NOT NULL
         GROUP BY response_option
         ORDER BY response_value DESC
         LIMIT {top_n}
@@ -2434,7 +2433,7 @@ def _build_demographic_breakout(demo_ids: list[str], top_n: int = 8) -> dict[str
                 SELECT
                     demo_level,
                     question_id,
-                    MAX(TRY_CAST(weighted_n AS DOUBLE)) AS weighted_n
+                    MAX(weighted_n_num) AS weighted_n
                 FROM survey_long
                 WHERE demo_id = '{demo_sql}'
                   AND demo_level IS NOT NULL
@@ -2715,9 +2714,9 @@ def _build_question_by_demographic(
             SELECT
                 demo_level,
                 response_option,
-                AVG(TRY_CAST(response_value AS DOUBLE)) AS response_value,
-                AVG(TRY_CAST(weighted_margin_of_error AS DOUBLE)) AS weighted_moe,
-                AVG(TRY_CAST(unweighted_margin_of_error AS DOUBLE)) AS unweighted_moe
+                AVG(response_value_num) AS response_value,
+                AVG(weighted_margin_of_error_num) AS weighted_moe,
+                AVG(unweighted_margin_of_error_num) AS unweighted_moe
             FROM survey_long
             WHERE question_id = '{qid_sql}'
               AND demo_id = '{did_sql}'
@@ -3109,9 +3108,9 @@ def _build_question_group_by_demographic(
                 question_id,
                 COALESCE(NULLIF(TRIM(question_level), ''), question_id) AS item_label,
                 demo_level,
-                AVG(TRY_CAST(response_value AS DOUBLE)) AS response_value,
-                AVG(TRY_CAST(weighted_margin_of_error AS DOUBLE)) AS weighted_moe,
-                AVG(TRY_CAST(unweighted_margin_of_error AS DOUBLE)) AS unweighted_moe
+                AVG(response_value_num) AS response_value,
+                AVG(weighted_margin_of_error_num) AS weighted_moe,
+                AVG(unweighted_margin_of_error_num) AS unweighted_moe
             FROM survey_long
             WHERE question_group = '{qg_sql}'
               AND demo_id = '{did_sql}'

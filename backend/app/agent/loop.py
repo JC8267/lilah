@@ -263,7 +263,11 @@ async def run_agent_loop(
                     result_str = json.dumps(result_data)
                 else:
                     try:
-                        result_str = handle_tool_call(tc.name, tc.input)
+                        result_str = await asyncio.to_thread(
+                            handle_tool_call,
+                            tc.name,
+                            tc.input,
+                        )
                         try:
                             result_data = json.loads(result_str)
                         except json.JSONDecodeError:
@@ -353,7 +357,8 @@ async def run_agent_loop(
                     full_text = "Completed a deterministic fallback analysis."
             else:
                 try:
-                    quick_raw = handle_tool_call(
+                    quick_raw = await asyncio.to_thread(
+                        handle_tool_call,
                         "quick_insight",
                         {"question": last_user_text, "top_n": 8},
                     )
@@ -377,7 +382,11 @@ async def run_agent_loop(
                     full_text = "Chart generated. Ask a narrower follow-up for a written insight."
                 else:
                     try:
-                        sq_raw = handle_tool_call("search_questions", {"keywords": last_user_text})
+                        sq_raw = await asyncio.to_thread(
+                            handle_tool_call,
+                            "search_questions",
+                            {"keywords": last_user_text},
+                        )
                         sq = json.loads(sq_raw)
                     except Exception:
                         sq = {}

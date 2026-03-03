@@ -5,12 +5,15 @@ import math
 import duckdb
 from pathlib import Path
 import re
+import threading
 from typing import Any
 
 from app.config import settings
 
 _con: duckdb.DuckDBPyConnection | None = None
 _semantic_index: dict[str, Any] | None = None
+_demo_dimensions_cache: list[dict[str, str]] | None = None
+_con_lock = threading.RLock()
 
 _TOKEN_RE = re.compile(r"[a-z0-9_']+")
 _QUERY_EXPANSIONS: dict[str, tuple[str, ...]] = {
@@ -165,18 +168,19 @@ def _build_semantic_index() -> None:
     con = get_connection()
 
     # Keep startup memory use low by avoiding a full scan/group-by over survey_long.
-    rows = con.execute("""
-        SELECT
-            question_id,
-            question_group,
-            question_text,
-            has_question_level,
-            response_option_count,
-            demo_break_count,
-            '' AS question_levels,
-            '' AS response_options
-        FROM question_catalog
-    """).fetchall()
+    with _con_lock:
+        rows = con.execute("""
+            SELECT
+                question_id,
+                question_group,
+                question_text,
+                has_question_level,
+                response_option_count,
+                demo_break_count,
+                '' AS question_levels,
+                '' AS response_options
+            FROM question_catalog
+        """).fetchall()
 
     docs: list[dict[str, Any]] = []
     doc_freq: Counter[str] = Counter()
@@ -322,53 +326,64 @@ def get_connection() -> duckdb.DuckDBPyConnection:
 
 def init_duckdb() -> None:
     """Expose CSVs via DuckDB views (low-memory mode for small Render instances)."""
-    global _con, _semantic_index
-    _con = duckdb.connect()
+    global _con, _semantic_index, _demo_dimensions_cache
+    with _con_lock:
+        _con = duckdb.connect()
 
-    survey_path = settings.data_dir / "survey_long.csv"
-    catalog_path = settings.data_dir / "question_catalog.csv"
+        survey_path = settings.data_dir / "survey_long.csv"
+        catalog_path = settings.data_dir / "question_catalog.csv"
 
-    survey_csv = survey_path.as_posix().replace("'", "''")
-    catalog_csv = catalog_path.as_posix().replace("'", "''")
+        survey_csv = survey_path.as_posix().replace("'", "''")
+        catalog_csv = catalog_path.as_posix().replace("'", "''")
 
-    # Constrain memory and allow spill to disk in constrained runtime environments.
-    _con.execute("PRAGMA memory_limit='256MB'")
-    _con.execute("PRAGMA threads=2")
-    _con.execute("PRAGMA temp_directory='/tmp'")
+        # Constrain memory and allow spill to disk in constrained runtime environments.
+        _con.execute("PRAGMA memory_limit='256MB'")
+        _con.execute("PRAGMA threads=2")
+        _con.execute("PRAGMA temp_directory='/tmp'")
 
-    _con.execute(f"""
-        CREATE OR REPLACE VIEW survey_long AS
-        SELECT * FROM read_csv_auto(
-            '{survey_csv}',
-            header=true,
-            sample_size=10000,
-            all_varchar=true
-        )
-    """)
+        _con.execute(f"""
+            CREATE OR REPLACE VIEW survey_long AS
+            SELECT
+                *,
+                TRY_CAST(response_value AS DOUBLE) AS response_value_num,
+                TRY_CAST(unweighted_n AS DOUBLE) AS unweighted_n_num,
+                TRY_CAST(weighted_n AS DOUBLE) AS weighted_n_num,
+                TRY_CAST(unweighted_margin_of_error AS DOUBLE) AS unweighted_margin_of_error_num,
+                TRY_CAST(weighted_margin_of_error AS DOUBLE) AS weighted_margin_of_error_num
+            FROM read_csv_auto(
+                '{survey_csv}',
+                header=true,
+                sample_size=10000,
+                all_varchar=true
+            )
+        """)
 
-    _con.execute(f"""
-        CREATE OR REPLACE VIEW question_catalog AS
-        SELECT * FROM read_csv_auto(
-            '{catalog_csv}',
-            header=true,
-            sample_size=10000,
-            all_varchar=true
-        )
-    """)
+        _con.execute(f"""
+            CREATE OR REPLACE VIEW question_catalog AS
+            SELECT * FROM read_csv_auto(
+                '{catalog_csv}',
+                header=true,
+                sample_size=10000,
+                all_varchar=true
+            )
+        """)
 
-    q_count = _con.execute("SELECT COUNT(*) FROM question_catalog").fetchone()[0]
+        q_count = _con.execute("SELECT COUNT(*) FROM question_catalog").fetchone()[0]
     _build_semantic_index()
+    _demo_dimensions_cache = None
     sem_count = int((_semantic_index or {}).get("doc_count", 0))
     print(f"DuckDB ready (CSV views): {q_count:,} questions")
     print(f"Semantic index ready: {sem_count:,} question docs")
 
 
 def close_duckdb() -> None:
-    global _con, _semantic_index
-    if _con is not None:
-        _con.close()
-        _con = None
+    global _con, _semantic_index, _demo_dimensions_cache
+    with _con_lock:
+        if _con is not None:
+            _con.close()
+            _con = None
     _semantic_index = None
+    _demo_dimensions_cache = None
 
 
 def execute_query(sql: str) -> dict:
@@ -392,9 +407,38 @@ def execute_query(sql: str) -> dict:
         cleaned += f" LIMIT {settings.max_query_rows}"
 
     try:
-        result = con.execute(cleaned)
-        columns = [desc[0] for desc in result.description]
-        rows = [list(row) for row in result.fetchall()]
+        with _con_lock:
+            result = con.execute(cleaned)
+            columns = [desc[0] for desc in result.description]
+            rows = [list(row) for row in result.fetchall()]
+        return {"columns": columns, "rows": rows, "row_count": len(rows)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def execute_query_params(sql: str, params: list[Any] | tuple[Any, ...]) -> dict:
+    """Execute a read-only SELECT with positional parameters."""
+    con = get_connection()
+
+    cleaned = sql.strip().rstrip(";")
+    upper = cleaned.upper()
+
+    if not (upper.startswith("SELECT") or upper.startswith("WITH")):
+        return {"error": "Only SELECT statements are allowed."}
+
+    for forbidden in ["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE",
+                      "TRUNCATE", "REPLACE", "ATTACH", "COPY", "EXPORT"]:
+        if forbidden in upper.split():
+            return {"error": f"Statement contains forbidden keyword: {forbidden}"}
+
+    if "LIMIT" not in upper:
+        cleaned += f" LIMIT {settings.max_query_rows}"
+
+    try:
+        with _con_lock:
+            result = con.execute(cleaned, list(params))
+            columns = [desc[0] for desc in result.description]
+            rows = [list(row) for row in result.fetchall()]
         return {"columns": columns, "rows": rows, "row_count": len(rows)}
     except Exception as e:
         return {"error": str(e)}
@@ -409,18 +453,20 @@ def search_questions(keywords: str) -> dict:
     terms = _filter_query_terms(query_tokens)
     if not terms:
         return {"error": "No keywords provided."}
-    terms = [t.replace("'", "''") for t in terms]
 
     lexical_rows: list[dict[str, Any]] = []
     lexical_error: str | None = None
     try:
+        # Use parameterized patterns to avoid interpolating arbitrary search terms into SQL.
+        patterns = [f"%{t}%" for t in terms]
+
         or_conditions = " OR ".join(
-            f"(question_text ILIKE '%{t}%' OR question_id ILIKE '%{t}%' OR question_group ILIKE '%{t}%')"
-            for t in terms
+            "(question_text ILIKE ? OR question_id ILIKE ? OR question_group ILIKE ?)"
+            for _ in patterns
         )
         score_expr = " + ".join(
-            f"CASE WHEN question_text ILIKE '%{t}%' OR question_id ILIKE '%{t}%' OR question_group ILIKE '%{t}%' THEN 1 ELSE 0 END"
-            for t in terms
+            "CASE WHEN question_text ILIKE ? OR question_id ILIKE ? OR question_group ILIKE ? THEN 1 ELSE 0 END"
+            for _ in patterns
         )
 
         sql = f"""
@@ -438,9 +484,18 @@ def search_questions(keywords: str) -> dict:
             LIMIT 100
         """
 
-        result = con.execute(sql)
-        columns = [desc[0] for desc in result.description]
-        lexical_rows = [dict(zip(columns, row)) for row in result.fetchall()]
+        # Parameter order follows placeholder order in SQL text:
+        # score expression placeholders first, then WHERE expression placeholders.
+        params: list[str] = []
+        for pattern in patterns:
+            params.extend([pattern, pattern, pattern])
+        for pattern in patterns:
+            params.extend([pattern, pattern, pattern])
+
+        with _con_lock:
+            result = con.execute(sql, params)
+            columns = [desc[0] for desc in result.description]
+            lexical_rows = [dict(zip(columns, row)) for row in result.fetchall()]
     except Exception as e:
         lexical_error = str(e)
 
@@ -532,21 +587,32 @@ def search_questions(keywords: str) -> dict:
 
 def get_demo_dimensions() -> list[dict]:
     """Return distinct demo_id / demo_level pairs."""
+    global _demo_dimensions_cache
+    if _demo_dimensions_cache is not None:
+        return list(_demo_dimensions_cache)
+
     con = get_connection()
-    result = con.execute("""
-        SELECT DISTINCT demo_id, demo_level
-        FROM survey_long
-        ORDER BY demo_id, demo_level
-    """)
-    return [{"demo_id": r[0], "demo_level": r[1]} for r in result.fetchall()]
+    with _con_lock:
+        result = con.execute("""
+            SELECT DISTINCT demo_id, demo_level
+            FROM survey_long
+            ORDER BY demo_id, demo_level
+        """)
+        rows = result.fetchall()
+    _demo_dimensions_cache = [
+        {"demo_id": str(r[0]), "demo_level": str(r[1])}
+        for r in rows
+    ]
+    return list(_demo_dimensions_cache)
 
 
 def get_schema_description() -> str:
     """Return a compact schema description for the system prompt."""
     con = get_connection()
 
-    survey_cols = con.execute("DESCRIBE survey_long").fetchall()
-    catalog_cols = con.execute("DESCRIBE question_catalog").fetchall()
+    with _con_lock:
+        survey_cols = con.execute("DESCRIBE survey_long").fetchall()
+        catalog_cols = con.execute("DESCRIBE question_catalog").fetchall()
 
     lines = ["## Table: survey_long (783K rows)"]
     for col in survey_cols:

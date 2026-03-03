@@ -77,10 +77,6 @@ async def chat(req: ChatRequest):
                 if etype == "chart":
                     collected_charts.append(data["spec"])
 
-                if etype == "error":
-                    error_text = f"Error: {data.get('message', 'Unknown error')}"
-                    await add_message(conv_id, "assistant", error_text, None)
-
                 if etype == "done":
                     # Save assistant message
                     await add_message(
@@ -101,8 +97,6 @@ async def chat(req: ChatRequest):
                     "data": json.dumps(data, default=str),
                 }
         except Exception as e:
-            error_text = f"Error: Chat stream crashed: {e}"
-            await add_message(conv_id, "assistant", error_text, None)
             yield {
                 "event": "error",
                 "data": json.dumps({"message": f"Chat stream crashed: {e}"}, default=str),

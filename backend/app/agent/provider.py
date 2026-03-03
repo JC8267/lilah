@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import socket
+import threading
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -410,6 +411,7 @@ def resolve_runtime_options(llm_override: dict[str, Any] | None) -> LLMRuntimeOp
 
 _provider_instance: BaseProvider | None = None
 _provider_signature: str | None = None
+_provider_lock = threading.Lock()
 
 
 def get_provider(options: LLMRuntimeOptions) -> BaseProvider:
@@ -417,17 +419,18 @@ def get_provider(options: LLMRuntimeOptions) -> BaseProvider:
     global _provider_instance, _provider_signature
 
     signature = options.provider_signature
-    if _provider_instance is not None and _provider_signature == signature:
+    with _provider_lock:
+        if _provider_instance is not None and _provider_signature == signature:
+            return _provider_instance
+
+        if options.provider == "anthropic":
+            _provider_instance = AnthropicProvider(api_key=options.api_key)
+        else:
+            _provider_instance = OpenAICompatibleProvider(
+                provider_name=options.provider,
+                base_url=options.base_url,
+                api_key=options.api_key,
+            )
+
+        _provider_signature = signature
         return _provider_instance
-
-    if options.provider == "anthropic":
-        _provider_instance = AnthropicProvider(api_key=options.api_key)
-    else:
-        _provider_instance = OpenAICompatibleProvider(
-            provider_name=options.provider,
-            base_url=options.base_url,
-            api_key=options.api_key,
-        )
-
-    _provider_signature = signature
-    return _provider_instance

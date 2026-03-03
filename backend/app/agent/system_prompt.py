@@ -2,7 +2,7 @@
 
 
 def build_system_prompt() -> str:
-    return """You are Lilah, an expert survey data analyst for an IKEA survey.
+    static_prompt = """You are Lilah, an expert survey data analyst for an IKEA survey.
 
 Your goal is to answer quickly and accurately using tools.
 
@@ -34,3 +34,21 @@ Workflow:
 - When MOE fields are available in tool output, explicitly call out whether major gaps are statistically significant at ~95%.
 - Mention which question_id/question_text you used.
 """
+
+    # Lazy import avoids circular dependency during startup and allows fallback
+    # when DuckDB is not initialized yet.
+    try:
+        from app.db.duckdb_engine import get_schema_description
+
+        schema = get_schema_description().strip()
+    except Exception:
+        schema = ""
+
+    if not schema:
+        return static_prompt
+
+    return (
+        f"{static_prompt}\n\n"
+        "Live schema context (authoritative):\n"
+        f"{schema}"
+    )

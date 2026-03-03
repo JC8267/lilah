@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.db.duckdb_engine import init_duckdb, close_duckdb
-from app.db.sqlite_store import init_sqlite
+from app.db.sqlite_store import init_sqlite, close_sqlite
 from app.config import settings
 from app.routes import chat, conversations, metadata
 
@@ -19,6 +19,7 @@ async def lifespan(app: FastAPI):
     print("Lilah backend ready")
     yield
     # Shutdown
+    await close_sqlite()
     close_duckdb()
 
 
