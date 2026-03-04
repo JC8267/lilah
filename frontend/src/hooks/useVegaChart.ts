@@ -15,15 +15,22 @@ export function useVegaChart(spec: VegaLiteSpec | null) {
     // Strip title from spec — ChartCard renders its own header
     const { title: _title, ...specWithoutTitle } = spec;
 
-    const fullSpec = {
-      ...specWithoutTitle,
-      ...(isFaceted
-        ? {}
-        : {
-            width: 'container' as const,
-            autosize: { type: 'fit-x' as const, contains: 'padding' as const },
-          }),
-    };
+    let fullSpec: Record<string, unknown>;
+
+    if (isFaceted) {
+      // Vega-Lite doesn't support autosize on faceted/concat specs, so we
+      // measure the container and set an explicit cell width instead.
+      const cw = containerRef.current.clientWidth;
+      // Reserve ~260px for y-axis labels, facet headers, and padding.
+      const cellWidth = cw > 0 ? Math.max(150, cw - 260) : 350;
+      fullSpec = { ...specWithoutTitle, width: cellWidth };
+    } else {
+      fullSpec = {
+        ...specWithoutTitle,
+        width: 'container' as const,
+        autosize: { type: 'fit-x' as const, contains: 'padding' as const },
+      };
+    }
 
     let cancelled = false;
 
