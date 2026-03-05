@@ -1419,6 +1419,12 @@ _BROAD_DIFF_OPERATOR_TERMS = (
     "differ most",
     "differ the most",
     "most different",
+    "major difference",
+    "major differences",
+    "main difference",
+    "main differences",
+    "key difference",
+    "key differences",
     "biggest difference",
     "biggest differences",
     "largest difference",
@@ -1473,7 +1479,10 @@ def _resolve_broad_demo_difference_request(text: str) -> dict[str, str] | None:
 
     has_scope_hint = any(t in q for t in _BROAD_DIFF_SCOPE_TERMS)
     has_what_form = bool(re.search(r"\bwhat\b.*\bdiffer\b.*\bmost\b", q))
-    if not (has_scope_hint or has_what_form):
+    has_major_difference_form = bool(
+        re.search(r"\bwhat\b.*\b(?:major|main|key|biggest|largest)\s+differen\w+\b", q)
+    )
+    if not (has_scope_hint or has_what_form or has_major_difference_form):
         return None
 
     demo_id = _normalize_broad_demo_id(_resolve_demo_id_from_text(q))

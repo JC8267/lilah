@@ -40,6 +40,14 @@ class BroadDemoDifferenceTests(unittest.TestCase):
         assert result is not None
         self.assertEqual(result.get("demo_id"), "TOTAL: Ethnicity")
 
+    def test_detects_housing_type_major_differences_query(self):
+        result = tools._resolve_broad_demo_difference_request(
+            "What are the major differences between those that live in houses vs apartments?"
+        )
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.get("demo_id"), "TOTAL: Housing Type")
+
     def test_specific_subject_query_does_not_use_broad_route(self):
         result = tools._resolve_broad_demo_difference_request(
             "What do renters vs owners differ the most in for room satisfaction?"
@@ -55,6 +63,20 @@ class BroadDemoDifferenceTests(unittest.TestCase):
         with patch.object(tools, "_build_broad_differences_by_demographic", return_value=payload) as mocked:
             result = tools.build_direct_result_for_user_query(
                 "What sort of things do renters vs owners differ the most in?"
+            )
+
+        self.assertEqual(result, payload)
+        mocked.assert_called_once()
+
+    def test_direct_route_uses_broad_builder_for_housing_type_major_differences(self):
+        payload = {
+            "analysis_type": "broad_demo_differences",
+            "demo_id": "TOTAL: Housing Type",
+            "insight_text": "ok",
+        }
+        with patch.object(tools, "_build_broad_differences_by_demographic", return_value=payload) as mocked:
+            result = tools.build_direct_result_for_user_query(
+                "What are the major differences between those that live in houses vs apartments?"
             )
 
         self.assertEqual(result, payload)
