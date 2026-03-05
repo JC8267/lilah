@@ -524,31 +524,55 @@ def _select_question_match_and_route(
     return heuristic_best, None
 
 
+_MATRIX_ITEM_TERMS = (
+    "furniture",
+    "furnishings",
+    "items",
+    "products",
+    "pieces",
+    "storage",
+    "sofa",
+    "couch",
+    "loveseat",
+    "sofa bed",
+    "rug",
+    "table",
+    "chair",
+    "armchair",
+    "bookcase",
+    "shelf",
+    "shelves",
+    "dresser",
+    "drawer",
+    "drawers",
+    "closet",
+    "nightstand",
+    "bin",
+    "container",
+    "media stand",
+)
+
+
+def _looks_like_matrix_item_topic(text: str) -> bool:
+    q = text.lower()
+    return any(t in q for t in _MATRIX_ITEM_TERMS)
+
+
+def _should_route_matrix_group(question: str) -> bool:
+    q = question.lower()
+    if _is_matrix_ownership_intent(q):
+        return True
+    if any(t in q for t in ("furniture", "furnishings", "items", "products", "pieces")):
+        return True
+    if any(t in q for t in ("purchase", "purchases", "buy", "buying", "plan", "planning")):
+        return _looks_like_matrix_item_topic(q)
+    return False
+
+
 def _is_matrix_ownership_intent(text: str) -> bool:
     q = text.lower()
     has_own = any(t in q for t in ("ownership", "owned", "own", "have", "has"))
-    has_itemish = any(
-        t in q
-        for t in (
-            "furniture",
-            "furnishings",
-            "items",
-            "products",
-            "pieces",
-            "sofa",
-            "couch",
-            "loveseat",
-            "sofa bed",
-            "rug",
-            "table",
-            "chair",
-            "armchair",
-            "bookcase",
-            "closet",
-            "media stand",
-        )
-    )
-    return has_own and has_itemish
+    return has_own and _looks_like_matrix_item_topic(q)
 
 
 def _extract_matrix_item_keywords(text: str) -> list[str]:
@@ -562,6 +586,20 @@ def _extract_matrix_item_keywords(text: str) -> list[str]:
         keywords.extend(["chair", "armchair"])
     if "table" in q:
         keywords.append("table")
+    if "storage" in q:
+        keywords.extend(
+            [
+                "storage",
+                "bookcase",
+                "shelf",
+                "dresser",
+                "drawer",
+                "closet",
+                "nightstand",
+                "bin",
+                "container",
+            ]
+        )
     return sorted(set(keywords))
 
 
@@ -2977,6 +3015,18 @@ def _build_quick_insight(
             if "error" not in cross:
                 return cross
 
+        if _should_route_matrix_group(subject_question):
+            matrix = _build_question_group_by_demographic(
+                question=subject_question,
+                demo_id=demo_id,
+                top_n_items=24,
+                item_keywords=_extract_matrix_item_keywords(subject_question),
+                target_demo_level=target_demo_level,
+                compare_to_others=apply_target_comparison,
+            )
+            if "error" not in matrix:
+                return matrix
+
         cross = _build_question_by_demographic(
             question=subject_question,
             demo_id=demo_id,
@@ -3504,6 +3554,29 @@ def _build_question_by_demographic(
     question_text = str(best.get("question_text", "")).strip()
     if not question_id:
         return {"error": "Matched question is missing question_id."}
+
+    question_group = str(best.get("question_group", "")).strip()
+    has_question_level = str(best.get("has_question_level", "")).strip().lower() in {"1", "true", "t", "yes"}
+    try:
+        response_option_count = int(best.get("response_option_count", 0) or 0)
+    except (TypeError, ValueError):
+        response_option_count = 0
+    if (
+        question_group
+        and has_question_level
+        and "_" in question_id
+        and response_option_count <= 2
+        and _should_route_matrix_group(question)
+    ):
+        return _build_question_group_by_demographic(
+            question=question,
+            demo_id=demo_id,
+            top_n_items=max(top_n_options * 4, 12),
+            item_keywords=_extract_matrix_item_keywords(question),
+            target_demo_level=target_demo_level,
+            compare_to_others=compare_to_others,
+            active_filters=active_filters,
+        )
 
     top_n_options = max(2, min(int(top_n_options), 8))
     qid_sql = _escape_sql_literal(question_id)
@@ -4775,7 +4848,7 @@ def build_direct_result_for_user_query(
                 if len(base_question) < 5:
                     base_question = cleaned
 
-                if _is_matrix_ownership_intent(base_question):
+                if _should_route_matrix_group(base_question):
                     item_keywords = _extract_matrix_item_keywords(base_question)
                     matrix = _build_question_group_by_demographic(
                         question=base_question,
@@ -4806,7 +4879,7 @@ def build_direct_result_for_user_query(
             if len(base_question) < 5:
                 base_question = cleaned
 
-            if _is_matrix_ownership_intent(base_question):
+            if _should_route_matrix_group(base_question):
                 item_keywords = _extract_matrix_item_keywords(base_question)
                 matrix = _build_question_group_by_demographic(
                     question=base_question,
@@ -4843,7 +4916,7 @@ def build_direct_result_for_user_query(
             )
 
     # Broad ownership phrasing without explicit "by".
-    if _is_matrix_ownership_intent(q):
+    if _should_route_matrix_group(q):
         demo_id = _resolve_demo_id_from_text(q)
         if demo_id:
             item_keywords = _extract_matrix_item_keywords(cleaned)
