@@ -13,12 +13,14 @@ interface ChatPanelProps {
 export function ChatPanel({ className = '' }: ChatPanelProps) {
   const messages = useChatStore((s) => s.messages);
   const isStreaming = useChatStore((s) => s.isStreaming);
+  const streamingText = useChatStore((s) => s.streamingText);
+  const streamingToolEvents = useChatStore((s) => s.streamingToolEvents);
   const { sendMessage } = useChat();
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, isStreaming]);
+  }, [messages, isStreaming, streamingText, streamingToolEvents.length]);
 
   return (
     <div className={`flex flex-col h-full ${className}`}>

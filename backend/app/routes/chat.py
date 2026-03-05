@@ -31,6 +31,71 @@ _active_streams_by_client: dict[str, int] = {}
 _active_streams_total = 0
 
 
+def _filter_dict_to_list(filters: dict[str, str] | None) -> list[dict[str, str]]:
+    if not isinstance(filters, dict):
+        return []
+    out: list[dict[str, str]] = []
+    for demo_id, demo_level in filters.items():
+        if not str(demo_id).strip() or not str(demo_level).strip():
+            continue
+        out.append(
+            {
+                "demo_id": str(demo_id).strip(),
+                "demo_level": str(demo_level).strip(),
+            }
+        )
+    return out
+
+
+def _summarize_tool_result(result: object) -> str | None:
+    if not isinstance(result, dict):
+        return None
+    error = result.get("error")
+    if isinstance(error, str) and error.strip():
+        return error.strip()
+    analysis_type = result.get("analysis_type")
+    if isinstance(analysis_type, str) and analysis_type.strip():
+        return analysis_type.strip().replace("_", " ")
+    question_id = result.get("question_id")
+    if isinstance(question_id, str) and question_id.strip():
+        return question_id.strip()
+    question_group = result.get("question_group")
+    if isinstance(question_group, str) and question_group.strip():
+        return question_group.strip()
+    return None
+
+
+def _mark_tool_event_done(
+    tool_events: list[dict[str, object]],
+    *,
+    label: str,
+    detail: str | None = None,
+    status: str = "done",
+) -> None:
+    for event in reversed(tool_events):
+        if (
+            event.get("kind") == "tool"
+            and event.get("label") == label
+            and event.get("status") == "running"
+        ):
+            event["status"] = status
+            event["updated_at"] = time.time()
+            if detail:
+                event["detail"] = detail
+            return
+
+    tool_events.append(
+        {
+            "kind": "tool",
+            "label": label,
+            "status": status,
+            "detail": detail,
+            "created_at": time.time(),
+            "updated_at": time.time(),
+        }
+    )
+
+
 def _log_struct(level: int, event: str, **fields: object) -> None:
     payload = {"event": event, **fields}
     logger.log(level, json.dumps(payload, default=str))
@@ -166,7 +231,13 @@ async def chat(req: ChatRequest, request: Request):
         )
 
         # Save user message
-        await add_message(conv_id, "user", req.message)
+        filter_snapshot = _filter_dict_to_list(req.filters)
+        await add_message(
+            conv_id,
+            "user",
+            req.message,
+            metadata={"active_filters": filter_snapshot} if filter_snapshot else None,
+        )
 
         # Build message history from DB
         db_messages = await get_messages(conv_id)
@@ -180,6 +251,7 @@ async def chat(req: ChatRequest, request: Request):
         async def event_generator():
             collected_text = ""
             collected_charts = []
+            collected_tool_events: list[dict[str, object]] = []
             cancel_event = asyncio.Event()
             poll_seconds = max(0.05, float(settings.chat_disconnect_poll_ms) / 1000.0)
             llm_override = req.llm_override.model_dump(exclude_none=True) if req.llm_override else None
@@ -243,10 +315,56 @@ async def chat(req: ChatRequest, request: Request):
                     if etype == "chart":
                         collected_charts.append(data["spec"])
 
+                    if etype == "status" and isinstance(data, dict) and data.get("message"):
+                        collected_tool_events.append(
+                            {
+                                "kind": "status",
+                                "label": str(data["message"]),
+                                "status": "done",
+                                "created_at": time.time(),
+                                "updated_at": time.time(),
+                            }
+                        )
+
+                    if etype == "tool_start" and isinstance(data, dict):
+                        collected_tool_events.append(
+                            {
+                                "kind": "tool",
+                                "label": str(data.get("tool", "tool")),
+                                "status": "running",
+                                "input": data.get("input"),
+                                "created_at": time.time(),
+                                "updated_at": time.time(),
+                            }
+                        )
+
+                    if etype == "tool_result" and isinstance(data, dict):
+                        result_payload = data.get("result")
+                        detail = _summarize_tool_result(result_payload)
+                        status = (
+                            "error"
+                            if isinstance(result_payload, dict) and result_payload.get("error")
+                            else "done"
+                        )
+                        _mark_tool_event_done(
+                            collected_tool_events,
+                            label=str(data.get("tool", "tool")),
+                            detail=detail,
+                            status=status,
+                        )
+
                     if etype == "done":
                         # Save assistant message
                         await add_message(
-                            conv_id, "assistant", collected_text, collected_charts or None
+                            conv_id,
+                            "assistant",
+                            collected_text,
+                            collected_charts or None,
+                            metadata={
+                                "active_filters": filter_snapshot,
+                                "tool_events": collected_tool_events,
+                                "request_id": request_id,
+                            },
                         )
 
                         # Auto-title on first exchange

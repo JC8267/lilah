@@ -68,6 +68,11 @@ class ChatRequest(BaseModel):
         if value is None:
             return None
 
+        if len(value) > 1:
+            raise ValueError(
+                "Only one active demographic filter is supported for this dataset."
+            )
+
         if len(value) > settings.chat_filters_max_items:
             raise ValueError(
                 f"filters may contain at most {settings.chat_filters_max_items} items."

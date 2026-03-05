@@ -1,62 +1,147 @@
-import { useCallback, useEffect, useRef } from 'react';
+import { useCallback, useEffect } from 'react';
 import { useChatStore } from '../stores/chat-store';
 import { useFilterStore } from '../stores/filter-store';
-import type { Message, VegaLiteSpec } from '../types';
+import type {
+  DemoFilter,
+  Message,
+  MessageMetadata,
+  ToolTraceEvent,
+  VegaLiteSpec,
+} from '../types';
+
+let activeAbortController: AbortController | null = null;
+let activeStreamId: string | null = null;
+
+function buildFilterSnapshot(filters: DemoFilter[]): DemoFilter[] {
+  return filters.slice(0, 1).map((filter) => ({
+    demo_id: filter.demo_id,
+    demo_level: filter.demo_level,
+  }));
+}
+
+function summarizeToolResult(result: unknown): string | undefined {
+  if (!result || typeof result !== 'object') return undefined;
+
+  const payload = result as Record<string, unknown>;
+  if (typeof payload.error === 'string' && payload.error.trim()) {
+    return payload.error.trim();
+  }
+  if (typeof payload.analysis_type === 'string' && payload.analysis_type.trim()) {
+    return payload.analysis_type.replace(/_/g, ' ');
+  }
+  if (typeof payload.question_id === 'string' && payload.question_id.trim()) {
+    return payload.question_id.trim();
+  }
+  if (typeof payload.question_group === 'string' && payload.question_group.trim()) {
+    return payload.question_group.trim();
+  }
+
+  return undefined;
+}
+
+async function buildErrorMessage(res: Response): Promise<string> {
+  try {
+    const payload = (await res.json()) as { detail?: string; request_id?: string };
+    if (payload.request_id) {
+      return payload.detail
+        ? `${payload.detail} (request ${payload.request_id})`
+        : `Request failed (request ${payload.request_id})`;
+    }
+    if (payload.detail) {
+      return payload.detail;
+    }
+  } catch {
+    // Fall back to status text below.
+  }
+
+  return res.statusText || `HTTP ${res.status}`;
+}
+
+export function abortActiveChatStream() {
+  const streamId = activeStreamId;
+  activeAbortController?.abort();
+  activeAbortController = null;
+  activeStreamId = null;
+
+  if (streamId) {
+    useChatStore.getState().cancelStreaming(streamId);
+  }
+}
 
 export function useChat() {
   const {
     startStreaming,
     appendStreamingText,
     addStreamingChart,
-    setToolStatus,
+    addStreamingToolEvent,
+    completeStreamingToolEvent,
+    setStreamingConversation,
     finishStreaming,
+    cancelStreaming,
     addMessage,
     setActiveConversation,
     addConversation,
     updateConversationTitle,
   } = useChatStore();
 
-  const activeFilters = useFilterStore((s) => s.activeFilters);
-  const abortRef = useRef<AbortController | null>(null);
+  const activeFilters = useFilterStore((state) => state.activeFilters);
 
   useEffect(() => {
     return () => {
-      abortRef.current?.abort();
-      abortRef.current = null;
+      abortActiveChatStream();
     };
   }, []);
 
   const sendMessage = useCallback(
     async (text: string) => {
-      if (!text.trim()) return;
+      const trimmed = text.trim();
+      if (!trimmed) return;
 
       const current = useChatStore.getState();
       if (current.isStreaming) {
-        abortRef.current?.abort();
+        abortActiveChatStream();
       }
+
       const conversationId = current.activeConversationId;
+      const streamId = crypto.randomUUID();
+      const filterSnapshot = buildFilterSnapshot(activeFilters);
 
       const userMsg: Message = {
         id: crypto.randomUUID(),
         conversation_id: conversationId || '',
         role: 'user',
-        content: text,
+        content: trimmed,
+        metadata: filterSnapshot.length > 0 ? { active_filters: filterSnapshot } : undefined,
         created_at: new Date().toISOString(),
       };
       addMessage(userMsg);
-      startStreaming();
+      startStreaming({ streamId, conversationId, filters: filterSnapshot });
 
-      const filters: Record<string, string> = {};
-      for (const f of activeFilters) {
-        filters[f.demo_id] = f.demo_level;
+      const filtersPayload: Record<string, string> = {};
+      for (const filter of filterSnapshot) {
+        filtersPayload[filter.demo_id] = filter.demo_level;
       }
 
       const controller = new AbortController();
-      abortRef.current = controller;
-      const finishIfActive = (finalText: string, finalCharts: VegaLiteSpec[]) => {
-        if (abortRef.current !== controller) return;
-        finishStreaming(finalText, finalCharts);
-        abortRef.current = null;
+      activeAbortController = controller;
+      activeStreamId = streamId;
+
+      const finishIfActive = (
+        finalText: string,
+        finalCharts: VegaLiteSpec[],
+        metadata?: MessageMetadata
+      ) => {
+        if (useChatStore.getState().streamId !== streamId) return;
+        finishStreaming({
+          streamId,
+          text: finalText,
+          charts: finalCharts,
+          metadata,
+        });
+        if (activeStreamId === streamId) {
+          activeAbortController = null;
+          activeStreamId = null;
+        }
       };
 
       try {
@@ -66,13 +151,14 @@ export function useChat() {
           signal: controller.signal,
           body: JSON.stringify({
             conversation_id: conversationId,
-            message: text,
-            filters: activeFilters.length > 0 ? filters : undefined,
+            message: trimmed,
+            filters: filterSnapshot.length > 0 ? filtersPayload : undefined,
           }),
         });
 
         if (!res.ok) {
-          finishIfActive(`Error: ${res.statusText}`, []);
+          const message = await buildErrorMessage(res);
+          finishIfActive(`Error: ${message}`, []);
           return;
         }
 
@@ -95,10 +181,9 @@ export function useChat() {
           if (done) break;
 
           buffer += decoder.decode(value, { stream: true });
-          // Normalize CRLF to LF so event splitting works across SSE servers.
           buffer = buffer.replace(/\r/g, '');
           lastEventAt = Date.now();
-          // Process complete SSE events (separated by a blank line).
+
           while (true) {
             const sepIndex = buffer.indexOf('\n\n');
             if (sepIndex === -1) break;
@@ -124,54 +209,83 @@ export function useChat() {
 
             const dataStr = dataLines.join('\n');
             try {
-              const data = JSON.parse(dataStr);
+              const data = JSON.parse(dataStr) as Record<string, unknown>;
 
               switch (eventType) {
                 case 'text_delta':
-                  collectedText += data.content || '';
-                  appendStreamingText(data.content || '');
+                  collectedText += String(data.content || '');
+                  appendStreamingText(streamId, String(data.content || ''));
                   break;
 
                 case 'tool_start':
-                  setToolStatus({
-                    tool: data.tool,
+                  addStreamingToolEvent(streamId, {
+                    kind: 'tool',
+                    label: String(data.tool || 'tool'),
                     status: 'running',
+                    input:
+                      data.input && typeof data.input === 'object'
+                        ? (data.input as Record<string, unknown>)
+                        : undefined,
+                    created_at: Date.now(),
+                    updated_at: Date.now(),
                   });
                   break;
 
                 case 'tool_result':
-                  setToolStatus({ tool: data.tool, status: 'done' });
+                  completeStreamingToolEvent(
+                    streamId,
+                    String(data.tool || 'tool'),
+                    data.result &&
+                      typeof data.result === 'object' &&
+                      'error' in (data.result as Record<string, unknown>)
+                      ? 'error'
+                      : 'done',
+                    summarizeToolResult(data.result)
+                  );
                   break;
 
                 case 'status':
                   if (data.message) {
-                    setToolStatus({ tool: String(data.message), status: 'running' });
+                    const event: ToolTraceEvent = {
+                      kind: 'status',
+                      label: String(data.message),
+                      status: 'done',
+                      created_at: Date.now(),
+                      updated_at: Date.now(),
+                    };
+                    addStreamingToolEvent(streamId, event);
                   }
                   break;
 
                 case 'chart':
                   if (data.spec) {
-                    collectedCharts.push(data.spec);
-                    addStreamingChart(data.spec);
+                    const spec = data.spec as VegaLiteSpec;
+                    collectedCharts.push(spec);
+                    addStreamingChart(streamId, spec);
                   }
                   break;
 
                 case 'conversation':
                   if (data.id && data.title) {
-                    const activeIdNow = useChatStore.getState().activeConversationId;
-                    if (!activeIdNow) {
-                      setActiveConversation(data.id as string);
+                    const resolvedId = String(data.id);
+                    const resolvedTitle = String(data.title);
+                    setStreamingConversation(streamId, resolvedId);
+
+                    const state = useChatStore.getState();
+                    const existing = state.conversations.find((conv) => conv.id === resolvedId);
+                    if (!existing) {
                       addConversation({
-                        id: data.id as string,
-                        title: data.title as string,
+                        id: resolvedId,
+                        title: resolvedTitle,
                         created_at: new Date().toISOString(),
                         updated_at: new Date().toISOString(),
                       });
                     } else {
-                      updateConversationTitle(
-                        data.id as string,
-                        data.title as string
-                      );
+                      updateConversationTitle(resolvedId, resolvedTitle);
+                    }
+
+                    if (!state.activeConversationId || state.activeConversationId === conversationId) {
+                      setActiveConversation(resolvedId);
                     }
                   }
                   break;
@@ -183,8 +297,11 @@ export function useChat() {
                     collectedCharts.length > 0
                       ? collectedCharts
                       : Array.isArray(data.charts)
-                        ? data.charts
-                        : []
+                        ? (data.charts as VegaLiteSpec[])
+                        : [],
+                    typeof data.request_id === 'string'
+                      ? { request_id: data.request_id }
+                      : undefined
                   );
                   return;
 
@@ -192,13 +309,17 @@ export function useChat() {
                   terminalEventSeen = true;
                   finishIfActive(
                     `Error: ${data.message || 'Unknown error'}`,
-                    []
+                    [],
+                    typeof data.request_id === 'string'
+                      ? { request_id: data.request_id }
+                      : undefined
                   );
                   return;
               }
             } catch {
-              // skip malformed event payloads
+              // Skip malformed event payloads.
             }
+
             lastEventAt = Date.now();
           }
 
@@ -208,40 +329,45 @@ export function useChat() {
           }
         }
 
-        // If stream ended without done/error, always terminate client streaming state.
         if (!terminalEventSeen) {
           if (collectedText || collectedCharts.length > 0) {
             finishIfActive(collectedText, collectedCharts);
           } else {
-            finishIfActive(
-              'Error: Stream ended before a final response was received.',
-              []
-            );
+            finishIfActive('Error: Stream ended before a final response was received.', []);
           }
         }
       } catch (err) {
         if (err instanceof DOMException && err.name === 'AbortError') {
-          if (abortRef.current === controller) {
-            abortRef.current = null;
+          if (activeStreamId === streamId) {
+            activeAbortController = null;
+            activeStreamId = null;
           }
+          cancelStreaming(streamId);
           return;
         }
-        finishIfActive(`Error: ${err instanceof Error ? err.message : 'Network error'}`, []);
+
+        finishIfActive(
+          `Error: ${err instanceof Error ? err.message : 'Network error'}`,
+          []
+        );
       }
     },
     [
       activeFilters,
-      startStreaming,
-      appendStreamingText,
-      addStreamingChart,
-      setToolStatus,
-      finishStreaming,
-      addMessage,
-      setActiveConversation,
       addConversation,
+      addMessage,
+      addStreamingChart,
+      addStreamingToolEvent,
+      appendStreamingText,
+      cancelStreaming,
+      completeStreamingToolEvent,
+      finishStreaming,
+      setActiveConversation,
+      setStreamingConversation,
+      startStreaming,
       updateConversationTitle,
     ]
   );
 
-  return { sendMessage };
+  return { sendMessage, stopStreaming: abortActiveChatStream };
 }

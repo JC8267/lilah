@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     chat_history_max_messages: int = 10
     chat_request_max_bytes: int = 65536
     chat_message_max_chars: int = 4000
-    chat_filters_max_items: int = 12
+    chat_filters_max_items: int = 1
     chat_filter_key_max_chars: int = 80
     chat_filter_value_max_chars: int = 200
     chat_rate_limit_per_minute: int = 30

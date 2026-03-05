@@ -37,7 +37,7 @@ export function FilterSidebar() {
         <div className="flex items-center gap-1.5">
           <SlidersHorizontal className="w-3.5 h-3.5 text-[var(--color-text-secondary)]" />
           <span className="text-xs font-medium text-[var(--color-text-secondary)]">
-            Filters
+            Segment Filter
           </span>
         </div>
         {activeFilters.length > 0 && (
@@ -67,9 +67,14 @@ export function FilterSidebar() {
         </div>
       )}
 
+      <p className="mb-2 text-[10px] leading-relaxed text-[var(--color-text-secondary)]">
+        One active segment at a time. Survey results are pre-aggregated, so filters do not
+        stack across multiple demographic dimensions.
+      </p>
+
       {/* Filter dropdowns */}
       <div className="text-[10px] font-semibold tracking-wider uppercase text-[var(--color-text-secondary)] mt-2 mb-1">
-        Demographics
+        Demographic Segments
       </div>
       <div className="space-y-1.5 max-h-64 overflow-y-auto">
         {Array.from(groups.entries())

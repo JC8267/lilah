@@ -58,6 +58,99 @@ def _resolve_demo_clause(
     )
 
 
+def _get_active_filter_entry(
+    active_filters: dict[str, str] | None,
+) -> dict[str, str] | None:
+    normalized = _normalize_active_filters(active_filters)
+    if not normalized:
+        return None
+    demo_id, demo_level = next(iter(normalized.items()))
+    return {"demo_id": demo_id, "demo_level": demo_level}
+
+
+def _build_filter_entry(
+    demo_id: str,
+    demo_level: str,
+    *,
+    reason: str | None = None,
+) -> dict[str, str]:
+    entry = {"demo_id": demo_id, "demo_level": demo_level}
+    if reason:
+        entry["reason"] = reason
+    return entry
+
+
+def _append_filter_notes(
+    lines: list[str],
+    *,
+    applied_filters: list[dict[str, str]] | None = None,
+    ignored_filters: list[dict[str, str]] | None = None,
+) -> None:
+    for active_filter in applied_filters or []:
+        lines.append(
+            f"- Active filter applied: **{active_filter['demo_id']} = {active_filter['demo_level']}**."
+        )
+
+    for ignored_filter in ignored_filters or []:
+        reason = ignored_filter.get("reason")
+        suffix = f" {reason}" if isinstance(reason, str) and reason.strip() else ""
+        lines.append(
+            f"- Active filter not applied: **{ignored_filter['demo_id']} = {ignored_filter['demo_level']}**.{suffix}"
+        )
+
+
+def _resolve_comparison_filter_context(
+    *,
+    demo_id: str,
+    active_filters: dict[str, str] | None = None,
+    target_demo_level: str | None = None,
+    compare_to_others: bool = False,
+) -> tuple[str | None, bool, list[dict[str, str]], list[dict[str, str]]]:
+    active_filter = _get_active_filter_entry(active_filters)
+    if not active_filter:
+        return target_demo_level, compare_to_others, [], []
+
+    if active_filter["demo_id"] != demo_id:
+        return (
+            target_demo_level,
+            compare_to_others,
+            [],
+            [
+                _build_filter_entry(
+                    active_filter["demo_id"],
+                    active_filter["demo_level"],
+                    reason=(
+                        "Cross-demographic comparisons can only focus a selected segment "
+                        "within the same demographic dimension."
+                    ),
+                )
+            ],
+        )
+
+    if target_demo_level and _short_demo_level(target_demo_level) != _short_demo_level(
+        active_filter["demo_level"]
+    ):
+        return (
+            target_demo_level,
+            compare_to_others,
+            [],
+            [
+                _build_filter_entry(
+                    active_filter["demo_id"],
+                    active_filter["demo_level"],
+                    reason=(
+                        "The request already specified a different target segment for this "
+                        "comparison."
+                    ),
+                )
+            ],
+        )
+
+    resolved_target = target_demo_level or active_filter["demo_level"]
+    resolved_compare = compare_to_others or bool(active_filter["demo_level"])
+    return resolved_target, resolved_compare, [active_filter], []
+
+
 def _short_demo_label(demo_id: str) -> str:
     if ":" in demo_id:
         return demo_id.split(":", 1)[1].strip()
@@ -1073,11 +1166,7 @@ def _build_top_selected_for_question_group(
     lines.append(f"- Concentration: top 3 items sum to **{top3_sum:.2f}%**.")
     lines.append(f"- Spread across shown items: **{spread:.2f} pts**.")
     lines.append(f"- Response basis: **{preferred}** in **{demo_slice}**.")
-    if applied_filters:
-        af = applied_filters[0]
-        lines.append(
-            f"- Active filter applied: **{af['demo_id']} = {af['demo_level']}**."
-        )
+    _append_filter_notes(lines, applied_filters=applied_filters)
     if clean_item_keywords:
         lines.append(f"- Filtered to items matching: {', '.join(sorted(set(clean_item_keywords)))}.")
 
@@ -2864,6 +2953,7 @@ def _build_quick_insight(
                 item_keywords=subject_room_route.get("item_keywords"),
                 target_demo_level=target_demo_level,
                 compare_to_others=apply_target_comparison,
+                active_filters=active_filters,
             )
             if "error" not in matrix:
                 return matrix
@@ -2873,6 +2963,7 @@ def _build_quick_insight(
                 top_n_options=5,
                 target_demo_level=target_demo_level,
                 compare_to_others=apply_target_comparison,
+                active_filters=active_filters,
             )
             if "error" not in cross:
                 return cross
@@ -2883,6 +2974,7 @@ def _build_quick_insight(
             top_n_options=5,
             target_demo_level=target_demo_level,
             compare_to_others=apply_target_comparison,
+            active_filters=active_filters,
         )
         if "error" not in cross:
             return cross
@@ -2906,12 +2998,21 @@ def _build_quick_insight(
         return _build_demographic_breakout(
             demo_ids=["TOTAL: Age", "TOTAL: Home Ownership"],
             top_n=8,
+            active_filters=active_filters,
         )
     if _is_age_demographic_intent(question):
-        return _build_demographic_breakout(demo_ids=["TOTAL: Age"], top_n=8)
+        return _build_demographic_breakout(
+            demo_ids=["TOTAL: Age"],
+            top_n=8,
+            active_filters=active_filters,
+        )
 
     if _is_housing_type_breakout_intent(question):
-        return _build_demographic_breakout(demo_ids=["TOTAL: Housing Type"], top_n=8)
+        return _build_demographic_breakout(
+            demo_ids=["TOTAL: Housing Type"],
+            top_n=8,
+            active_filters=active_filters,
+        )
 
     search_result = search_questions(question)
     if "error" in search_result:
@@ -2934,7 +3035,11 @@ def _build_quick_insight(
     if best is None:
         best, routed_demo_id = _select_question_match_and_route(question, matches)
         if routed_demo_id:
-            return _build_demographic_breakout(demo_ids=[routed_demo_id], top_n=8)
+            return _build_demographic_breakout(
+                demo_ids=[routed_demo_id],
+                top_n=8,
+                active_filters=active_filters,
+            )
 
     best = best or matches[0]
     question_id = str(best.get("question_id", "")).strip()
@@ -3091,15 +3196,12 @@ def _build_quick_insight(
     summary_lines.append(
         f"- Spread between highest and lowest shown options: **{spread:.2f} pts**."
     )
-    if applied_filters:
-        af = applied_filters[0]
-        summary_lines.append(
-            f"- Active filter applied: **{af['demo_id']} = {af['demo_level']}**."
-        )
+    _append_filter_notes(summary_lines, applied_filters=applied_filters)
     summary_lines.append("- Values shown are percentages of respondents.")
     insight_text = "\n".join(summary_lines)
 
     return {
+        "analysis_type": "quick_insight",
         "question_id": question_id,
         "question_text": question_text,
         "sql": sql.strip(),
@@ -3111,13 +3213,30 @@ def _build_quick_insight(
     }
 
 
-def _build_demographic_breakout(demo_ids: list[str], top_n: int = 8) -> dict[str, Any]:
+def _build_demographic_breakout(
+    demo_ids: list[str],
+    top_n: int = 8,
+    active_filters: dict[str, str] | None = None,
+) -> dict[str, Any]:
     demo_ids = [d.strip() for d in demo_ids if d and d.strip()]
     if not demo_ids:
         return {"error": "No demographic dimensions supplied."}
 
     top_n = max(3, min(int(top_n), 12))
     dimensions: list[dict[str, Any]] = []
+    ignored_filters: list[dict[str, str]] = []
+    active_filter = _get_active_filter_entry(active_filters)
+    if active_filter:
+        ignored_filters.append(
+            _build_filter_entry(
+                active_filter["demo_id"],
+                active_filter["demo_level"],
+                reason=(
+                    "Demographic breakouts already show the full distribution for one "
+                    "dimension and cannot be re-sliced by another aggregate segment."
+                ),
+            )
+        )
 
     for demo_id in demo_ids:
         demo_sql = _escape_sql_literal(demo_id)
@@ -3338,6 +3457,7 @@ def _build_demographic_breakout(demo_ids: list[str], top_n: int = 8) -> dict[str
             "config": _CHART_CONFIG,
         }
 
+    _append_filter_notes(narrative_lines, ignored_filters=ignored_filters)
     narrative_lines.append(
         "- Method note: shares are estimated using median `weighted_n` across question IDs for each demographic level."
     )
@@ -3345,6 +3465,7 @@ def _build_demographic_breakout(demo_ids: list[str], top_n: int = 8) -> dict[str
     result: dict[str, Any] = {
         "analysis_type": "demographic_breakout",
         "dimensions": dimensions,
+        "ignored_filters": ignored_filters,
         "insight_text": "\n".join(narrative_lines),
     }
     if chart_spec:
@@ -3358,6 +3479,7 @@ def _build_question_by_demographic(
     top_n_options: int = 5,
     target_demo_level: str | None = None,
     compare_to_others: bool = False,
+    active_filters: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     search_result = search_questions(question)
     if "error" in search_result:
@@ -3377,6 +3499,14 @@ def _build_question_by_demographic(
     top_n_options = max(2, min(int(top_n_options), 8))
     qid_sql = _escape_sql_literal(question_id)
     did_sql = _escape_sql_literal(demo_id)
+    target_demo_level, compare_to_others, applied_filters, ignored_filters = (
+        _resolve_comparison_filter_context(
+            demo_id=demo_id,
+            active_filters=active_filters,
+            target_demo_level=target_demo_level,
+            compare_to_others=compare_to_others,
+        )
+    )
     selected_only = False
     response_filter_sql = ""
 
@@ -3558,6 +3688,11 @@ def _build_question_by_demographic(
                 f"- Significant option-level differences for this comparison (~95%): **{len(significant_diffs)}/{len(option_stats)}**.",
                 "- 'Other groups' are the average of remaining demographic levels in this dimension.",
             ]
+            _append_filter_notes(
+                narrative_lines,
+                applied_filters=applied_filters,
+                ignored_filters=ignored_filters,
+            )
             if missing_moe_count > 0:
                 narrative_lines.append(
                     f"- Significance unavailable for **{missing_moe_count}** option(s) due to missing MOE values."
@@ -3640,6 +3775,8 @@ def _build_question_by_demographic(
                 "target_demo_level": target_demo_level,
                 "comparison": "target_vs_others",
                 "row_count": len(chart_target_values),
+                "applied_filters": applied_filters,
+                "ignored_filters": ignored_filters,
                 "significant_differences": [
                     {
                         "response_option": d["option"],
@@ -3741,6 +3878,11 @@ def _build_question_by_demographic(
         narrative_lines.append(
             f"- Significance unavailable for **{missing_moe_count}** option(s) due to missing MOE values."
         )
+    _append_filter_notes(
+        narrative_lines,
+        applied_filters=applied_filters,
+        ignored_filters=ignored_filters,
+    )
     narrative_lines.append(
         f"- Coverage: **{len(demo_levels)}** demographic levels and **{len(option_levels)}** response options shown."
     )
@@ -3868,6 +4010,8 @@ def _build_question_by_demographic(
         "question_text": question_text,
         "demo_id": demo_id,
         "row_count": len(chart_values),
+        "applied_filters": applied_filters,
+        "ignored_filters": ignored_filters,
         "significant_differences": [
             {
                 "response_option": d["option"],
@@ -3893,6 +4037,7 @@ def _build_question_group_by_demographic(
     item_keywords: list[str] | None = None,
     target_demo_level: str | None = None,
     compare_to_others: bool = False,
+    active_filters: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Cross-tab a matrix-like question group (e.g., IKEA102 items) by demographic."""
     search_result = search_questions(question)
@@ -3914,6 +4059,14 @@ def _build_question_group_by_demographic(
 
     qg_sql = _escape_sql_literal(question_group)
     did_sql = _escape_sql_literal(demo_id)
+    target_demo_level, compare_to_others, applied_filters, ignored_filters = (
+        _resolve_comparison_filter_context(
+            demo_id=demo_id,
+            active_filters=active_filters,
+            target_demo_level=target_demo_level,
+            compare_to_others=compare_to_others,
+        )
+    )
 
     options_sql = f"""
         SELECT DISTINCT response_option
@@ -4088,6 +4241,11 @@ def _build_question_group_by_demographic(
                 f"- Items with statistically significant differences (~95%): **{len(significant)}**.",
                 "- 'Other groups' are the average of remaining demographic levels.",
             ]
+            _append_filter_notes(
+                narrative_lines,
+                applied_filters=applied_filters,
+                ignored_filters=ignored_filters,
+            )
             if clean_item_keywords:
                 narrative_lines.append(
                     f"- Item filter applied: {', '.join(sorted(set(clean_item_keywords)))}."
@@ -4176,6 +4334,8 @@ def _build_question_group_by_demographic(
                 "selected_response_option": preferred,
                 "item_keywords": clean_item_keywords or None,
                 "item_count": len(item_stats_target),
+                "applied_filters": applied_filters,
+                "ignored_filters": ignored_filters,
                 "significant_item_count": len(significant),
                 "significant_differences": [
                     {
@@ -4243,6 +4403,11 @@ def _build_question_group_by_demographic(
         narrative_lines.append(
             f"- Significance unavailable for **{len(missing_moe)}** items because MOE values were missing."
         )
+    _append_filter_notes(
+        narrative_lines,
+        applied_filters=applied_filters,
+        ignored_filters=ignored_filters,
+    )
     narrative_lines.append(
         "- Significance uses source-tab MOE fields; treat as directional when reviewing many items."
     )
@@ -4314,6 +4479,8 @@ def _build_question_group_by_demographic(
         "selected_response_option": preferred,
         "item_keywords": clean_item_keywords or None,
         "item_count": len(item_stats),
+        "applied_filters": applied_filters,
+        "ignored_filters": ignored_filters,
         "significant_item_count": len(significant),
         "significant_differences": [
             {
@@ -4423,11 +4590,11 @@ def _resolve_effective_active_filters(
     active_filters: dict[str, str] | None,
     inferred_filters: dict[str, str] | None = None,
 ) -> dict[str, str] | None:
-    inferred = _normalize_active_filters(inferred_filters)
-    if inferred:
-        return inferred
     normalized = _normalize_active_filters(active_filters)
-    return normalized or None
+    if normalized:
+        return normalized
+    inferred = _normalize_active_filters(inferred_filters)
+    return inferred or None
 
 
 def build_direct_result_for_user_query(
@@ -4546,6 +4713,7 @@ def build_direct_result_for_user_query(
             question="income",
             demo_id="TOTAL: Children in Household",
             top_n_options=5,
+            active_filters=effective_filters,
         )
         if "error" not in cross:
             return cross
@@ -4554,17 +4722,20 @@ def build_direct_result_for_user_query(
         return _build_demographic_breakout(
             demo_ids=["TOTAL: Income", "TOTAL: Children in Household"],
             top_n=8,
+            active_filters=effective_filters,
         )
 
     if _is_age_homeownership_intent(cleaned):
         return _build_demographic_breakout(
             demo_ids=["TOTAL: Age", "TOTAL: Home Ownership"],
             top_n=8,
+            active_filters=effective_filters,
         )
     if _is_age_demographic_intent(cleaned):
         return _build_demographic_breakout(
             demo_ids=["TOTAL: Age"],
             top_n=8,
+            active_filters=effective_filters,
         )
 
     if _is_home_size_intent(cleaned):
@@ -4581,6 +4752,7 @@ def build_direct_result_for_user_query(
         return _build_demographic_breakout(
             demo_ids=["TOTAL: Housing Type"],
             top_n=8,
+            active_filters=effective_filters,
         )
 
     # Generic comparison phrasing: "<question> differ ... for <segment expr>".
@@ -4601,6 +4773,7 @@ def build_direct_result_for_user_query(
                         demo_id=demo_id,
                         top_n_items=24,
                         item_keywords=item_keywords,
+                        active_filters=effective_filters,
                     )
                     if "error" not in matrix:
                         return matrix
@@ -4609,6 +4782,7 @@ def build_direct_result_for_user_query(
                     question=base_question,
                     demo_id=demo_id,
                     top_n_options=5,
+                    active_filters=effective_filters,
                 )
                 if "error" not in cross:
                     return cross
@@ -4630,6 +4804,7 @@ def build_direct_result_for_user_query(
                     demo_id=demo_id,
                     top_n_items=24,
                     item_keywords=item_keywords,
+                    active_filters=effective_filters,
                 )
                 if "error" not in matrix:
                     return matrix
@@ -4638,19 +4813,25 @@ def build_direct_result_for_user_query(
                 question=base_question,
                 demo_id=demo_id,
                 top_n_options=5,
+                active_filters=effective_filters,
             )
             if "error" in cross and base_question != cleaned:
                 cross = _build_question_by_demographic(
                     question=cleaned,
                     demo_id=demo_id,
                     top_n_options=5,
+                    active_filters=effective_filters,
                 )
             return cross
 
     if has_breakout_intent:
         demo_id = _resolve_demo_id_from_text(q)
         if demo_id:
-            return _build_demographic_breakout(demo_ids=[demo_id], top_n=8)
+            return _build_demographic_breakout(
+                demo_ids=[demo_id],
+                top_n=8,
+                active_filters=effective_filters,
+            )
 
     # Broad ownership phrasing without explicit "by".
     if _is_matrix_ownership_intent(q):
@@ -4662,6 +4843,7 @@ def build_direct_result_for_user_query(
                 demo_id=demo_id,
                 top_n_items=24,
                 item_keywords=item_keywords,
+                active_filters=effective_filters,
             )
             if "error" not in matrix:
                 return matrix
@@ -4756,6 +4938,21 @@ TOOL_DEFINITIONS = [
                     "maximum": 8,
                     "default": 5,
                 },
+                "target_demo_level": {
+                    "type": "string",
+                    "description": (
+                        "Optional exact demographic level to focus, for example "
+                        "'TOTAL: Age 18-34'."
+                    ),
+                },
+                "compare_to_others": {
+                    "type": "boolean",
+                    "description": (
+                        "When true, compare the target demographic level against all "
+                        "other levels in the same demographic dimension."
+                    ),
+                    "default": False,
+                },
             },
             "required": ["question", "demo_id"],
         },
@@ -4788,6 +4985,21 @@ TOOL_DEFINITIONS = [
                     "items": {"type": "string"},
                     "description": "Optional item-level filters (e.g. ['sofa','couch']).",
                 },
+                "target_demo_level": {
+                    "type": "string",
+                    "description": (
+                        "Optional exact demographic level to focus, for example "
+                        "'TOTAL: Income: $50K-$74K'."
+                    ),
+                },
+                "compare_to_others": {
+                    "type": "boolean",
+                    "description": (
+                        "When true, compare the target demographic level against all "
+                        "other levels in the same demographic dimension."
+                    ),
+                    "default": False,
+                },
             },
             "required": ["question", "demo_id"],
         },
@@ -4813,7 +5025,7 @@ TOOL_DEFINITIONS = [
         "name": "query_data",
         "description": (
             "Execute a read-only SQL SELECT against the DuckDB database. "
-            "Tables available: survey_long, question_catalog. Returns up to 500 rows."
+            "Tables available: survey_long, question_catalog. Returns up to 200 rows."
         ),
         "input_schema": {
             "type": "object",
@@ -4865,12 +5077,18 @@ def handle_tool_call(
         result = _build_demographic_breakout(
             demo_ids=demo_ids,
             top_n=int(tool_input.get("top_n", 8)),
+            active_filters=active_filters,
         )
     elif tool_name == "question_by_demographic":
         result = _build_question_by_demographic(
             question=str(tool_input.get("question", "")),
             demo_id=str(tool_input.get("demo_id", "")),
             top_n_options=int(tool_input.get("top_n_options", 5)),
+            target_demo_level=(
+                str(tool_input.get("target_demo_level", "")).strip() or None
+            ),
+            compare_to_others=bool(tool_input.get("compare_to_others", False)),
+            active_filters=active_filters,
         )
     elif tool_name == "question_group_by_demographic":
         raw_item_keywords = tool_input.get("item_keywords", [])
@@ -4884,6 +5102,11 @@ def handle_tool_call(
             demo_id=str(tool_input.get("demo_id", "")),
             top_n_items=int(tool_input.get("top_n_items", 20)),
             item_keywords=item_keywords,
+            target_demo_level=(
+                str(tool_input.get("target_demo_level", "")).strip() or None
+            ),
+            compare_to_others=bool(tool_input.get("compare_to_others", False)),
+            active_filters=active_filters,
         )
     elif tool_name == "search_questions":
         result = search_questions(tool_input["keywords"])

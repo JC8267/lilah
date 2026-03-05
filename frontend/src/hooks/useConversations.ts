@@ -1,4 +1,5 @@
-import { useEffect, useCallback } from 'react';
+import { useEffect, useCallback, useRef } from 'react';
+import { abortActiveChatStream } from './useChat';
 import { useChatStore } from '../stores/chat-store';
 import type { Message } from '../types';
 
@@ -10,6 +11,8 @@ export function useConversations() {
     setMessages,
     removeConversation,
   } = useChatStore();
+  const isStreaming = useChatStore((state) => state.isStreaming);
+  const selectionAbortRef = useRef<AbortController | null>(null);
 
   const loadConversations = useCallback(async () => {
     setConversationsLoading(true);
@@ -28,27 +31,47 @@ export function useConversations() {
 
   const selectConversation = useCallback(
     async (id: string) => {
+      if (isStreaming) {
+        abortActiveChatStream();
+      }
+
+      selectionAbortRef.current?.abort();
+      selectionAbortRef.current = new AbortController();
+
       setActiveConversation(id);
+      setMessages([]);
+
       try {
-        const res = await fetch(`/api/conversations/${id}/messages`);
+        const res = await fetch(`/api/conversations/${id}/messages`, {
+          signal: selectionAbortRef.current.signal,
+        });
         if (res.ok) {
           const msgs: Message[] = await res.json();
           setMessages(msgs);
         }
-      } catch {
-        // ignore
+      } catch (err) {
+        if (err instanceof DOMException && err.name === 'AbortError') {
+          return;
+        }
       }
     },
-    [setActiveConversation, setMessages]
+    [isStreaming, setActiveConversation, setMessages]
   );
 
   const newConversation = useCallback(() => {
+    if (isStreaming) {
+      abortActiveChatStream();
+    }
+    selectionAbortRef.current?.abort();
     setActiveConversation(null);
     setMessages([]);
-  }, [setActiveConversation, setMessages]);
+  }, [isStreaming, setActiveConversation, setMessages]);
 
   const deleteConversation = useCallback(
     async (id: string) => {
+      if (isStreaming) {
+        abortActiveChatStream();
+      }
       try {
         await fetch(`/api/conversations/${id}`, { method: 'DELETE' });
         removeConversation(id);
@@ -56,11 +79,14 @@ export function useConversations() {
         // ignore
       }
     },
-    [removeConversation]
+    [isStreaming, removeConversation]
   );
 
   useEffect(() => {
     loadConversations();
+    return () => {
+      selectionAbortRef.current?.abort();
+    };
   }, [loadConversations]);
 
   return { loadConversations, selectConversation, newConversation, deleteConversation };

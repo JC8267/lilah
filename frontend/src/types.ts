@@ -11,6 +11,7 @@ export interface Message {
   role: 'user' | 'assistant';
   content: string;
   charts?: VegaLiteSpec[];
+  metadata?: MessageMetadata;
   created_at: string;
 }
 
@@ -29,4 +30,20 @@ export interface DemoFilter {
 export interface DemoDimension {
   demo_id: string;
   demo_level: string;
+}
+
+export interface ToolTraceEvent {
+  kind: 'status' | 'tool';
+  label: string;
+  status: 'running' | 'done' | 'error';
+  detail?: string;
+  input?: Record<string, unknown>;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface MessageMetadata {
+  active_filters?: DemoFilter[];
+  tool_events?: ToolTraceEvent[];
+  request_id?: string;
 }

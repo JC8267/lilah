@@ -17,12 +17,7 @@ export const useFilterStore = create<FilterState>((set) => ({
   setDimensions: (dims) => set({ dimensions: dims }),
 
   addFilter: (filter) =>
-    set((s) => ({
-      activeFilters: [
-        ...s.activeFilters.filter((f) => f.demo_id !== filter.demo_id),
-        filter,
-      ],
-    })),
+    set({ activeFilters: [filter] }),
 
   removeFilter: (demo_id) =>
     set((s) => ({

@@ -50,10 +50,15 @@ async def init_sqlite() -> None:
             role TEXT NOT NULL,
             content TEXT NOT NULL,
             charts TEXT,
+            metadata TEXT,
             created_at TEXT NOT NULL,
             FOREIGN KEY (conversation_id) REFERENCES conversations(id)
         )
     """)
+    columns = await db.execute_fetchall("PRAGMA table_info(messages)")
+    column_names = {str(row[1]) for row in columns}
+    if "metadata" not in column_names:
+        await db.execute("ALTER TABLE messages ADD COLUMN metadata TEXT")
     await db.execute(
         "CREATE INDEX IF NOT EXISTS idx_conversations_updated_at "
         "ON conversations(updated_at)"
@@ -120,16 +125,21 @@ async def delete_conversation(conv_id: str) -> None:
 
 
 async def add_message(
-    conversation_id: str, role: str, content: str, charts: list | None = None
+    conversation_id: str,
+    role: str,
+    content: str,
+    charts: list | None = None,
+    metadata: dict | None = None,
 ) -> dict:
     now = datetime.now(timezone.utc).isoformat()
     msg_id = str(uuid.uuid4())
     charts_json = json.dumps(charts) if charts else None
+    metadata_json = json.dumps(metadata) if metadata else None
     db = await _get_db()
     await db.execute(
-        "INSERT INTO messages (id, conversation_id, role, content, charts, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (msg_id, conversation_id, role, content, charts_json, now),
+        "INSERT INTO messages (id, conversation_id, role, content, charts, metadata, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (msg_id, conversation_id, role, content, charts_json, metadata_json, now),
     )
     await db.execute(
         "UPDATE conversations SET updated_at = ? WHERE id = ?",
@@ -142,6 +152,7 @@ async def add_message(
         "role": role,
         "content": content,
         "charts": charts,
+        "metadata": metadata,
         "created_at": now,
     }
 
@@ -156,5 +167,6 @@ async def get_messages(conversation_id: str) -> list[dict]:
     for r in rows:
         d = dict(r)
         d["charts"] = json.loads(d["charts"]) if d["charts"] else None
+        d["metadata"] = json.loads(d["metadata"]) if d.get("metadata") else None
         result.append(d)
     return result

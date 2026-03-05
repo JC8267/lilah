@@ -64,6 +64,8 @@ def _compact_tool_result_for_model(tool_name: str, result_data: Any) -> str:
             "row_count": result_data.get("row_count"),
             "top_rows": (result_data.get("top_rows") or [])[:12],
             "chart": result_data.get("chart"),
+            "applied_filters": result_data.get("applied_filters"),
+            "ignored_filters": result_data.get("ignored_filters"),
             "insight_text": result_data.get("insight_text"),
             "error": result_data.get("error"),
         }
@@ -73,6 +75,7 @@ def _compact_tool_result_for_model(tool_name: str, result_data: Any) -> str:
         compact = {
             "analysis_type": result_data.get("analysis_type"),
             "dimensions": result_data.get("dimensions"),
+            "ignored_filters": result_data.get("ignored_filters"),
             "chart": result_data.get("chart"),
             "insight_text": result_data.get("insight_text"),
             "error": result_data.get("error"),
@@ -86,6 +89,8 @@ def _compact_tool_result_for_model(tool_name: str, result_data: Any) -> str:
             "question_text": result_data.get("question_text"),
             "demo_id": result_data.get("demo_id"),
             "row_count": result_data.get("row_count"),
+            "applied_filters": result_data.get("applied_filters"),
+            "ignored_filters": result_data.get("ignored_filters"),
             "chart": result_data.get("chart"),
             "insight_text": result_data.get("insight_text"),
             "error": result_data.get("error"),
@@ -101,6 +106,8 @@ def _compact_tool_result_for_model(tool_name: str, result_data: Any) -> str:
             "selected_response_option": result_data.get("selected_response_option"),
             "item_keywords": result_data.get("item_keywords"),
             "item_count": result_data.get("item_count"),
+            "applied_filters": result_data.get("applied_filters"),
+            "ignored_filters": result_data.get("ignored_filters"),
             "significant_item_count": result_data.get("significant_item_count"),
             "significant_differences": result_data.get("significant_differences"),
             "chart": result_data.get("chart"),
@@ -135,6 +142,33 @@ def _tool_call_signature(name: str, tool_input: dict[str, Any]) -> str:
     except Exception:
         payload = str(tool_input)
     return f"{name}:{payload}"
+
+
+def _build_turn_system_prompt(
+    base_prompt: str,
+    active_filters: dict[str, str] | None,
+) -> str:
+    if not isinstance(active_filters, dict) or not active_filters:
+        return base_prompt
+
+    filter_lines = []
+    for demo_id, demo_level in active_filters.items():
+        demo_id_text = str(demo_id).strip()
+        demo_level_text = str(demo_level).strip()
+        if not demo_id_text or not demo_level_text:
+            continue
+        filter_lines.append(f"- {demo_id_text} = {demo_level_text}")
+
+    if not filter_lines:
+        return base_prompt
+
+    return (
+        f"{base_prompt}\n\n"
+        "Active segment context for this turn:\n"
+        f"{chr(10).join(filter_lines)}\n"
+        "Treat this as the default survey slice. This dataset supports one active "
+        "demographic segment at a time; preserve it unless the user explicitly changes segment."
+    )
 
 
 async def run_agent_loop(
@@ -194,7 +228,10 @@ async def run_agent_loop(
             message_count=len(messages),
         )
         provider = get_provider(llm_options)
-        system_prompt = build_system_prompt()
+        system_prompt = _build_turn_system_prompt(
+            build_system_prompt(),
+            active_filters,
+        )
         charts: list[dict] = []
         full_text = ""
         fallback_insight_text = ""

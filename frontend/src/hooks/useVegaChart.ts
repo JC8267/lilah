@@ -45,7 +45,8 @@ export function useVegaChart(spec: VegaLiteSpec | null) {
     if (!containerRef.current || !spec) return;
 
     // Strip title from spec — ChartCard renders its own header
-    const { title: _title, ...specWithoutTitle } = spec;
+    const specWithoutTitle = { ...spec };
+    delete specWithoutTitle.title;
 
     let fullSpec: Record<string, unknown>;
 

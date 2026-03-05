@@ -1,41 +1,16 @@
 import ReactMarkdown from 'react-markdown';
-import { User, Bot } from 'lucide-react';
+import { Bot, CheckCircle2, User, XCircle } from 'lucide-react';
 import type { Message } from '../../types';
 
 interface MessageBubbleProps {
   message: Message;
 }
 
-const MAX_CHART_SUMMARY_CHARS = 220;
-
-function summarizeChartBackedMessage(content: string): string {
-  const lines = content
-    .split('\n')
-    .map((line) => line.trim())
-    .filter(Boolean);
-
-  if (lines.length === 0) {
-    return 'Analysis completed. See Key Insights for detailed metrics.';
-  }
-
-  const headline = lines[0].replace(/^[\-*]\s+/, '').trim();
-  if (!headline) {
-    return 'Analysis completed. See Key Insights for detailed metrics.';
-  }
-
-  if (headline.length <= MAX_CHART_SUMMARY_CHARS) {
-    return headline;
-  }
-
-  return `${headline.slice(0, MAX_CHART_SUMMARY_CHARS - 1).trimEnd()}…`;
-}
-
 export function MessageBubble({ message }: MessageBubbleProps) {
   const isUser = message.role === 'user';
   const hasCharts = !isUser && Array.isArray(message.charts) && message.charts.length > 0;
-  const compactSummary = hasCharts
-    ? summarizeChartBackedMessage(message.content)
-    : '';
+  const filters = message.metadata?.active_filters || [];
+  const toolEvents = message.metadata?.tool_events || [];
 
   return (
     <div className={`flex gap-3 ${isUser ? 'justify-end' : ''}`}>
@@ -51,19 +26,55 @@ export function MessageBubble({ message }: MessageBubbleProps) {
             : 'bg-[var(--color-surface-alt)] text-[var(--color-text)] border-l-2 border-[var(--color-primary)]/20'
         }`}
       >
+        {filters.length > 0 && (
+          <div className={`mb-3 flex flex-wrap gap-2 ${isUser ? 'text-white/90' : ''}`}>
+            {filters.map((filter) => (
+              <span
+                key={`${filter.demo_id}:${filter.demo_level}`}
+                className={`inline-flex items-center rounded-full px-2 py-1 text-[11px] font-medium ${
+                  isUser
+                    ? 'bg-white/15 text-white'
+                    : 'bg-white text-[var(--color-primary)]'
+                }`}
+              >
+                {filter.demo_level.replace(/^(TOTAL|CUSTOMER|PROSPECT): /, '')}
+              </span>
+            ))}
+          </div>
+        )}
         {isUser ? (
           <p className="whitespace-pre-wrap">{message.content}</p>
-        ) : hasCharts ? (
-          <div>
-            <p className="whitespace-pre-wrap">{compactSummary}</p>
-            <p className="mt-2 text-xs text-[var(--color-text-secondary)]">
-              Full metrics are shown in Key Insights next to the chart.
-            </p>
-          </div>
         ) : (
           <div className="prose prose-sm max-w-none [&_p]:my-1 [&_ul]:my-1 [&_li]:my-0.5 [&_strong]:font-semibold [&_a]:text-[var(--color-primary)]">
             <ReactMarkdown>{message.content}</ReactMarkdown>
           </div>
+        )}
+        {!isUser && toolEvents.length > 0 && (
+          <details className="mt-3 border-t border-[var(--color-border)]/70 pt-3">
+            <summary className="cursor-pointer text-xs font-medium text-[var(--color-text-secondary)]">
+              Execution Trace
+            </summary>
+            <div className="mt-2 space-y-1.5 text-xs text-[var(--color-text-secondary)]">
+              {toolEvents.map((event, index) => (
+                <div key={`${event.label}-${index}`} className="flex items-start gap-2">
+                  {event.status === 'error' ? (
+                    <XCircle className="mt-0.5 h-3.5 w-3.5 text-red-500" />
+                  ) : (
+                    <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 text-emerald-600" />
+                  )}
+                  <div>
+                    <div className="font-medium text-[var(--color-text)]">{event.label}</div>
+                    {event.detail && <div>{event.detail}</div>}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </details>
+        )}
+        {!isUser && hasCharts && (
+          <p className="mt-3 text-xs text-[var(--color-text-secondary)]">
+            Charts for this answer are available in the canvas.
+          </p>
         )}
       </div>
       {isUser && (
