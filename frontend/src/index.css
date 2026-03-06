@@ -44,10 +44,20 @@ body {
   display: block;
 }
 
-/* Suppress the default Vega title since we render our own in ChartCard header.
-   Only suppress the top-level title element (first <text> with class "role-title"). */
+.chart-container {
+  scrollbar-gutter: stable both-edges;
+}
+
 .chart-container .vega-embed {
-  width: 100%;
+  display: inline-block;
+  width: max-content;
+  min-width: 100%;
+  max-width: none !important;
+}
+
+.chart-container .vega-embed > div {
+  width: max-content;
+  min-width: 100%;
 }
 
 /* ── Custom Vega tooltip ── */

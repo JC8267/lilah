@@ -2,6 +2,10 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import embed, { type Result } from 'vega-embed';
 import type { VegaLiteSpec } from '../types';
 
+const MIN_CHART_RENDER_WIDTH = 760;
+const FACET_LABEL_GUTTER = 220;
+const MIN_FACET_CELL_WIDTH = 560;
+
 export function useVegaChart(spec: VegaLiteSpec | null) {
   const containerRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<Result | null>(null);
@@ -11,6 +15,10 @@ export function useVegaChart(spec: VegaLiteSpec | null) {
     () => Boolean(spec && ('facet' in spec || 'concat' in spec || 'hconcat' in spec || 'vconcat' in spec)),
     [spec],
   );
+  const renderWidth =
+    containerWidth > 0
+      ? Math.max(containerWidth, MIN_CHART_RENDER_WIDTH)
+      : MIN_CHART_RENDER_WIDTH;
 
   useEffect(() => {
     if (!spec || !containerRef.current) return;
@@ -38,9 +46,6 @@ export function useVegaChart(spec: VegaLiteSpec | null) {
     };
   }, [spec]);
 
-  // Re-embed faceted specs as width changes; single-view specs can resize in-place.
-  const facetedWidth = isFaceted ? containerWidth : 0;
-
   useEffect(() => {
     if (!containerRef.current || !spec) return;
 
@@ -51,17 +56,19 @@ export function useVegaChart(spec: VegaLiteSpec | null) {
     let fullSpec: Record<string, unknown>;
 
     if (isFaceted) {
-      // Vega-Lite doesn't support autosize on faceted/concat specs, so we
-      // measure the container and set an explicit cell width instead.
-      const cw = facetedWidth || containerRef.current.clientWidth;
-      // Reserve room for y-labels/facet headers while still using most of the panel.
-      const cellWidth = cw > 0 ? Math.max(220, cw - 180) : 420;
-      fullSpec = { ...specWithoutTitle, width: cellWidth };
+      // Faceted specs do not support fit-x well, so keep each cell wide enough
+      // to preserve labels and let the card scroll when the panel is narrow.
+      const cellWidth = Math.max(MIN_FACET_CELL_WIDTH, renderWidth - FACET_LABEL_GUTTER);
+      fullSpec = {
+        ...specWithoutTitle,
+        width: cellWidth,
+        autosize: { type: 'pad' as const, contains: 'padding' as const },
+      };
     } else {
       fullSpec = {
         ...specWithoutTitle,
-        width: 'container' as const,
-        autosize: { type: 'fit-x' as const, contains: 'padding' as const },
+        width: renderWidth,
+        autosize: { type: 'pad' as const, contains: 'padding' as const },
       };
     }
 
@@ -76,11 +83,6 @@ export function useVegaChart(spec: VegaLiteSpec | null) {
       .then((result) => {
         if (!cancelled) {
           viewRef.current = result;
-          if (!isFaceted) {
-            void result.view.resize().runAsync().catch(() => {
-              // Ignore best-effort resize failures.
-            });
-          }
         } else {
           result.finalize();
         }
@@ -96,14 +98,7 @@ export function useVegaChart(spec: VegaLiteSpec | null) {
         viewRef.current = null;
       }
     };
-  }, [spec, isFaceted, facetedWidth]);
-
-  useEffect(() => {
-    if (isFaceted || !viewRef.current) return;
-    void viewRef.current.view.resize().runAsync().catch(() => {
-      // Ignore best-effort resize failures.
-    });
-  }, [containerWidth, isFaceted]);
+  }, [spec, isFaceted, renderWidth]);
 
   const exportPNG = async (): Promise<string | null> => {
     if (!viewRef.current) return null;
